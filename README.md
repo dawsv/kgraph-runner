@@ -53,3 +53,4 @@ python -m unittest discover -s tests -v
 ```
 
 The initial engine was extracted from [SmithShroom's shared runner](https://github.com/dawsv/SmithShroom/blob/2c1d08e837e5f4862ffbb94739f79cbcd351b768/Tools/GraphLibrary/engine.py).
+See the [SmithShroom migration handoff](docs/SmithShroom-migration.md) for the dependency pin and verification steps.
