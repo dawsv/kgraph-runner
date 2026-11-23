@@ -1,13 +1,13 @@
-# GraphLibrary
+# KGraph Runner
 
-A Python runner for verified workflows. GraphLibrary runs ordered and parallel steps, nests subgraphs, caches verified output, and retries individual failed steps with bounded repair loops. It has no runtime dependencies beyond Python 3.9 or later.
+A Python runner for verified workflows. KGraph runs ordered and parallel steps, nests subgraphs, caches verified output, and retries individual failed steps with bounded repair loops. It has no runtime dependencies beyond Python 3.9 or later. The K is for Kippy.
 
 ## Install
 
 Use GitHub credentials with read access to this private repository. Pin a release tag or full commit SHA in each consuming project's dependencies.
 
 ```sh
-python -m pip install 'graph-library @ git+https://github.com/dawsv/graph-library.git@v0.1.0'
+python -m pip install 'kgraph-runner @ git+https://github.com/dawsv/kgraph-runner.git@v0.1.1'
 ```
 
 ## Run a workflow
@@ -17,7 +17,7 @@ Define the steps, their dependencies, and the checks for your project. Each node
 ```python
 from pathlib import Path
 
-from graph_library import GraphRunner, TaskNode, sha256_json
+from kgraph_runner import GraphRunner, TaskNode, sha256_json
 
 output = Path("greeting.txt")
 

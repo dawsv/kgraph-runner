@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from graph_library import (
+from kgraph_runner import (
     GraphFailure,
     GraphRunner,
     LoopSubgraphNode,
