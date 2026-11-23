@@ -4,10 +4,10 @@ A Python runner for verified workflows. KGraph runs ordered and parallel steps, 
 
 ## Install
 
-Use GitHub credentials with read access to this private repository. Pin a release tag or full commit SHA in each consuming project's dependencies.
+Install the public release wheel from GitHub. Pin a release version in each consuming project's dependencies.
 
 ```sh
-python -m pip install 'kgraph-runner @ git+https://github.com/dawsv/kgraph-runner.git@v0.1.1'
+python -m pip install 'https://github.com/dawsv/kgraph-runner/releases/download/v0.1.1/kgraph_runner-0.1.1-py3-none-any.whl'
 ```
 
 ## Run a workflow

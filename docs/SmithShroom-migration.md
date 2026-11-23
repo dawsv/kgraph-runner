@@ -1,6 +1,6 @@
 # Move SmithShroom to KGraph Runner
 
-Replace SmithShroom’s bundled Python graph engine with the private `kgraph-runner` dependency. Keep the Town Event and Game Regression workflows, project CLI, verification scripts, and Unity integration in SmithShroom.
+Replace SmithShroom’s bundled Python graph engine with the `kgraph-runner` dependency. Keep the Town Event and Game Regression workflows, project CLI, verification scripts, and Unity integration in SmithShroom.
 
 ## Start from the existing checkout
 
@@ -16,19 +16,20 @@ Add this line to the existing graph-tooling requirements. If there is no require
 kgraph-runner==0.1.1 --hash=sha256:7bb1dde08938ca41fc7cc25c1d29f7f8e8289ddee21b1364393cc10ad7ebc41a
 ```
 
-From the SmithShroom root, install into the same environment that already runs its graph CLI. This example uses the dedicated requirements file and downloads the wheel into the ignored validation folder. GitHub authentication needs read access to `dawsv/kgraph-runner`.
+From the SmithShroom root, install into the same environment that already runs its graph CLI. This example uses the dedicated requirements file and downloads the public release wheel into the ignored validation folder.
 
 ```sh
 graph_python=Validation/presentation-tools/bin/python
 kgraph_wheels=Validation/kgraph-runner/v0.1.1
+kgraph_wheel=kgraph_runner-0.1.1-py3-none-any.whl
 mkdir -p "$kgraph_wheels"
-gh release download v0.1.1 --repo dawsv/kgraph-runner \
-  --pattern 'kgraph_runner-0.1.1-py3-none-any.whl' --dir "$kgraph_wheels" --skip-existing
+curl --fail --location --output "$kgraph_wheels/$kgraph_wheel" \
+  "https://github.com/dawsv/kgraph-runner/releases/download/v0.1.1/$kgraph_wheel"
 uv pip install --python "$graph_python" --no-index --no-deps --require-hashes \
   --find-links "$kgraph_wheels" -r Tools/GraphLibrary/requirements-kgraph.txt
 ```
 
-If you add the pin to a shared requirements file, use its normal installer and private artifact access, or pass this single pinned dependency to the offline install above. Use the existing interpreter on each development or CI machine that runs the graph tools.
+If you add the pin to a shared requirements file, use its normal installer with the public release wheel as a package source, or pass this single pinned dependency to the offline install above. Use the existing interpreter on each development or CI machine that runs the graph tools.
 
 ## Replace the engine implementation
 
