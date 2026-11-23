@@ -45,6 +45,9 @@ greeting = TaskNode(
 GraphRunner(Path("graph-state.json")).run([greeting], {"name": "Redcap"})
 ```
 
+The source tree includes [workflow helpers](src/kgraph_runner/helpers.py) for hashing, command checks, and artifact gates.
+See [workflow patterns](docs/workflow-patterns.md) for reusable examples.
+
 ## Test
 
 ```sh
