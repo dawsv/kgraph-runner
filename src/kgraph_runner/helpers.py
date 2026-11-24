@@ -28,10 +28,11 @@ def _ignored(path, root, ignore_dirs):
     return any(part in ignore_dirs for part in _relative_path(path, root).parts)
 
 
-def hash_paths(paths, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS) -> str:
-    """Hash file names relative to root and their contents in sorted order."""
+def hash_paths(paths, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS, exclude_paths=()) -> str:
+    """Hash sorted file names and contents, skipping ignored directories and excluded files."""
     root = Path(root or Path.cwd()).absolute()
     ignore_dirs = frozenset(ignore_dirs)
+    excluded = {Path(os.path.abspath(root / value)) for value in exclude_paths}
     files = set()
     for value in paths:
         path = Path(os.path.abspath(root / value))
@@ -48,7 +49,7 @@ def hash_paths(paths, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS) -> str:
                         files.add(file)
 
     digest = hashlib.sha256()
-    for relative, path in sorted((_relative_path(path, root).as_posix(), path) for path in files):
+    for relative, path in sorted((_relative_path(path, root).as_posix(), path) for path in files - excluded):
         content = hashlib.sha256()
         with path.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
@@ -57,13 +58,14 @@ def hash_paths(paths, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS) -> str:
     return digest.hexdigest()
 
 
-def hash_globs(patterns, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS) -> str:
+def hash_globs(patterns, *, root=None, ignore_dirs=DEFAULT_IGNORE_DIRS, exclude_paths=()) -> str:
     """Hash files matched by glob patterns relative to root."""
     root = Path(root or Path.cwd()).absolute()
     return hash_paths(
         (path for pattern in patterns for path in root.glob(pattern)),
         root=root,
         ignore_dirs=ignore_dirs,
+        exclude_paths=exclude_paths,
     )
 
 

@@ -47,6 +47,7 @@ GraphRunner(Path("graph-state.json")).run([greeting], {"name": "Redcap"})
 
 The source tree includes [workflow helpers](src/kgraph_runner/helpers.py) for hashing, command checks, and artifact gates.
 See [workflow patterns](docs/workflow-patterns.md) for reusable examples.
+See the [bug-fixing subgraph handoff](docs/bug-fixing-subgraph-handoff.md) for resumable desktop fixes, Histoury review and release, and game regression suites.
 
 ## Test
 
