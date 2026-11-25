@@ -220,6 +220,7 @@ def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_ret
             "stage": "user_verify_gate", "review_summary": str(review_paths[1]),
             "review_summary_json": str(review_paths[0]), "review_sha256": review_hash,
             "manual_qa_checklist": str(qa_checklist), "qa_scorecard": str(review_dir / "qa_scorecard.md"),
+            "bugs": [{"id": bug["id"], "title": bug["title"]} for bug in selected_bugs()],
             "stale_approval_sha256": current if stale_approval(current, review_hash) else None,
             "outputs": [str(approval)],
             "instructions": [

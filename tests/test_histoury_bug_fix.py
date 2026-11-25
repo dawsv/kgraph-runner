@@ -8,7 +8,12 @@ import textwrap
 import unittest
 from zipfile import ZipFile
 
-from kgraph_runner import create_histoury_bug_fix_graph, create_version_history_subgraph
+from kgraph_runner import (
+    build_town_snapshot,
+    create_histoury_bug_fix_graph,
+    create_version_history_subgraph,
+    submit_gate_response,
+)
 from kgraph_runner.subgraphs import find_version_history_builder
 
 from _support import read_json, run_workflow, write_json, write_png
@@ -37,7 +42,7 @@ class HistouryWorkflowTest(unittest.TestCase):
         self.home.mkdir()
         self.repo = self.root / "repo with spaces"
         self.repo.mkdir()
-        self.work = self.root / "work"
+        self.work = self.root / ".kgraph" / "work"
         self.release = self.work / "version_history"
         self.pkg = self.release / "package"
         self.review = self.work / "review"
@@ -281,6 +286,29 @@ class HistouryWorkflowTest(unittest.TestCase):
         write_json(self.commit, {"committed": True, "commits": [commit]})
         self.run_graph()
         self.run_graph(max_worker_calls=0)
+
+    def test_town_rejection_refixes_only_the_checked_bug(self):
+        other = {**BUG, "id": "app-43", "title": "Preserve the selected profile", "requires_ui_capture": False}
+        packet = self.reach_user_gate(direct=True, other_bug=other)
+        state = self.root / ".kgraph/workflow_state.json"
+        report = state.with_name("workflow_report.json")
+        snapshot = build_town_snapshot(state_path=state, report_path=report)
+        gate = snapshot["attention"]["input_gate"]
+        self.assertTrue(gate["can_respond"])
+        self.assertEqual(gate["bugs"], [{"id": bug["id"], "title": bug["title"]} for bug in (BUG, other)])
+        status, result = submit_gate_response(
+            {"state_path": str(state), "report_path": str(report)},
+            {"node_path": gate["node_path"], "packet_hash": gate["packet_hash"],
+             "approved": False, "rejected_bugs": [other["id"]]},
+        )
+        self.assertEqual(status, 200, result)
+        decision = read_json(self.approval)
+        self.assertEqual(decision["rejected_by"], "Reviewer")
+        self.assertEqual(decision["review_sha256"], packet["review_sha256"])
+        retry = self.run_graph(stage="apply_fix", error="revision 1")
+        self.assertEqual(retry["bug_id"], other["id"])
+        self.assertEqual(read_json(self.review / "review_feedback.json")["rejected_bugs"], [other["id"]])
+        self.assert_release_has_not_started()
 
     def test_review_rejection_refixes_only_selected_bugs_and_requires_fresh_approval(self):
         other = {**BUG, "id": "app-43", "requires_ui_capture": False}

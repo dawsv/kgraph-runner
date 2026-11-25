@@ -49,6 +49,8 @@ The source tree includes [workflow helpers](src/kgraph_runner/helpers.py) for ha
 See [workflow patterns](docs/workflow-patterns.md) for reusable examples.
 See the [bug-fixing subgraph handoff](docs/bug-fixing-subgraph-handoff.md) for resumable desktop fixes, Histoury review and release, and game regression suites.
 
+- Use `kgraph-town` for live sub-task progress, drill-down, questions, and approvals. [Hero Town handoff](docs/hero-town-interactive-subgraph-handoff.md)
+
 ## Test
 
 ```sh

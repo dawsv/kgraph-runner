@@ -1,4 +1,4 @@
-"""File and identifier conventions shared by the workflow builders."""
+"""File and identifier conventions shared by the runner."""
 
 from contextlib import contextmanager
 import json
@@ -32,14 +32,16 @@ def write_text(path, content):
         with NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=path.parent, delete=False) as file:
             draft = Path(file.name)
             file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
         draft.replace(path)
     finally:
         if draft is not None:
             draft.unlink(missing_ok=True)
 
 
-def write_json(path, data, *, ensure_ascii=True):
-    write_text(path, json.dumps(data, indent=2, ensure_ascii=ensure_ascii) + "\n")
+def write_json(path, data, *, ensure_ascii=True, indent=2):
+    write_text(path, json.dumps(data, indent=indent, ensure_ascii=ensure_ascii, allow_nan=False) + "\n")
 
 
 @contextmanager

@@ -9,5 +9,8 @@ description = "A Python runner for verifiable, composable workflows."
 readme = "README.md"
 requires-python = ">=3.9"
 
+[project.scripts]
+kgraph-town = "kgraph_runner.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
