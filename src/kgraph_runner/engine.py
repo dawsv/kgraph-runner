@@ -708,4 +708,7 @@ class GraphRunner:
             if len(errors) == 1:
                 raise errors[0]
             summary = "; ".join(str(e) for e in errors)
+            awaiting = [e for e in errors if isinstance(e, GraphFailure) and e.awaiting_subagents]
+            if len(awaiting) == len(errors):
+                raise GraphFailure(full_path, summary, awaiting_subagents=True, packet_path=awaiting[0].packet_path)
             raise GraphFailure(full_path, f"{len(errors)} splitter branch(es) failed: {summary}")
