@@ -1404,7 +1404,11 @@ print('Built release', file=sys.stderr)
             assert!(!dir.join("desktop-42.zip").exists());
             if mode == "check_failure" {
                 let checked = read_object(&dir.join("check_result.json")).unwrap();
-                let digest = fingerprint(json!(["Validated <package>/release.json\n"]));
+                let expected = format!(
+                    "Validated <package>{}release.json\n",
+                    std::path::MAIN_SEPARATOR
+                );
+                let digest = fingerprint(json!([expected]));
                 assert_eq!(
                     checked["error_signature"],
                     format!("vh_check_failed:{}", &digest[..8])
@@ -1425,11 +1429,26 @@ print('Built release', file=sys.stderr)
         // Exercise the fallback everywhere, plus the installed skill builder when available.
         for builder in std::iter::once(None).chain(find_version_history_builder(None).map(Some)) {
             let root = TempDir::new().unwrap();
-            let dir = resolve(root.path()).unwrap().join("version_history");
-            let cfg = config(root.path());
+            let root_path = {
+                let canon = root.path().canonicalize().unwrap();
+                #[cfg(windows)]
+                {
+                    canon
+                        .to_str()
+                        .and_then(|s| s.strip_prefix(r"\\?\"))
+                        .map(PathBuf::from)
+                        .unwrap_or(canon)
+                }
+                #[cfg(not(windows))]
+                {
+                    canon
+                }
+            };
+            let dir = resolve(&root_path).unwrap().join("version_history");
+            let cfg = config(&root_path);
             let node = Node::LoopSubgraph(create_subgraph(cfg, builder.clone()).unwrap());
             let runner =
-                GraphRunner::new(RunnerConfig::new(root.path().join("rust_state.json"))).unwrap();
+                GraphRunner::new(RunnerConfig::new(root_path.join("rust_state.json"))).unwrap();
             assert!(
                 runner
                     .run(std::slice::from_ref(&node), &Context::new(), "")
@@ -1485,7 +1504,7 @@ assert manifest == built
             let output = Command::new(if cfg!(windows) { "python" } else { "python3" })
                 .arg("-c")
                 .arg(script)
-                .arg(root.path())
+                .arg(&root_path)
                 .arg(builder.as_deref().unwrap_or(Path::new("")))
                 .env("PYTHONDONTWRITEBYTECODE", "1")
                 .env("PYTHONPATH", &reference)

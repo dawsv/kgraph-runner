@@ -800,7 +800,15 @@ fn open_regular_file(path: &Path) -> Result<fs::File, String> {
     #[cfg(unix)]
     let file = open_resolved(path);
     #[cfg(not(unix))]
-    let file = fs::File::open(path);
+    let file = {
+        if !fs::metadata(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?
+            .is_file()
+        {
+            return Err(format!("Expected a regular file at {}", path.display()));
+        }
+        fs::File::open(path)
+    };
     let file = file.map_err(|e| format!("{}: {e}", path.display()))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
         return Err(format!("Expected a regular file at {}", path.display()));
@@ -3050,7 +3058,7 @@ max_retries = 1
         let dir = temp.path().canonicalize().unwrap();
         temp_repo(&dir);
         let cmd = json!(["python3","-c",
-            "import os,sys,json,time; from pathlib import Path; p=Path('shared.txt'); assert p.read_text()=='original\\n' and Path(os.environ['KGRAPH_WORKTREE'])==Path.cwd(); p.write_text(sys.argv[1]+'\\n'); time.sleep(.05); assert p.read_text().strip()==sys.argv[1]; Path('out.json').write_text(json.dumps(sys.argv[1])); print(json.dumps(sys.argv[1]))",
+            "import os,sys,json,time; from pathlib import Path; p=Path('shared.txt'); assert p.read_text()=='original\\n' and Path(os.environ['KGRAPH_WORKTREE']).resolve()==Path.cwd().resolve(); p.write_text(sys.argv[1]+'\\n'); time.sleep(.05); assert p.read_text().strip()==sys.argv[1]; Path('out.json').write_text(json.dumps(sys.argv[1])); print(json.dumps(sys.argv[1]))",
             "{{item}}"]);
         for (kind, task) in [
             (
@@ -3101,7 +3109,7 @@ max_retries = 1
             "id":"nested","type":"splitter","items":[4,2],"max_workers":2,"isolation":"worktree",
             "reduce":{"from_output":"answer.json","to_ctx":"answers","op":"collect_list"},
             "template":{"id":"branch-{{item}}","type":"subgraph","nodes":[{
-                "id":"write","type":"shell","env":{"N":"{{item}}"},"command":"echo \"$N\" > answer.json","outputs":["answer.json"]
+                "id":"write","type":"shell","env":{"N":"{{item}}"},"command":["python3","-c","import os; open('answer.json','w').write(os.environ['N'])"],"outputs":["answer.json"]
             }]}
         }]})).unwrap();
         runner(dir.path()).run(&wf.nodes, &wf.context, "").unwrap();
