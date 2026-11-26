@@ -12,6 +12,7 @@ from ._files import file_lock, read_object, write_json, write_text
 MANUAL_QA_VALUES = ("pass", "fail", "blocked", "not_tested", "skipped")
 GAP_TYPES = (None, "missing_verifier", "logic_bug", "ui_regression", "spec_changed", "env_blocker", "other")
 AUTOMATED_STATUSES = ("pass", "fail", "pending", "blocked")
+_DEFAULT_TESTER = "Daniel"
 _MANUAL_FIELDS = ("manual_qa", "resolved_on_attempt", "gap_type", "notes")
 _CASE_IDENTITY = ("title", "platform", "kind", "ai_attempts")
 _MARKDOWN_ESCAPES = {ord(char): f"&#{ord(char)};" for char in "\\|`*[]~"}
@@ -95,7 +96,7 @@ def _checklist(data):
         "batch_id": _required_text(data.get("batch_id"), "batch_id"),
         "workflow_type": _required_text(data.get("workflow_type", "custom"), "workflow_type"),
         "title": _optional_text(data.get("title"), "title"),
-        "tester": _required_text(data.get("tester", "Daniel"), "tester"),
+        "tester": _required_text(data.get("tester", _DEFAULT_TESTER), "tester"),
         "build_ref": _optional_text(data.get("build_ref"), "build_ref"),
         "updated_at": _optional_text(data.get("updated_at"), "updated_at"),
         "cases": list(_normalize_cases(data["cases"]).values()),
@@ -138,13 +139,21 @@ def _lock_path(path):
     return path.with_name(path.name + ".lock")
 
 
-def init_qa_checklist(output_path, *, batch_id, cases, workflow_type="custom", title=None, tester="Daniel",
+def _configured_tester(tester):
+    if tester is not None:
+        return _required_text(tester, "tester")
+    return os.environ.get("KGRAPH_TESTER", "").strip() or None
+
+
+def init_qa_checklist(output_path, *, batch_id, cases, workflow_type="custom", title=None, tester=None,
                       build_ref=None, state_path=None, preserve_existing=True):
-    """Refresh automated evidence and keep manual results for cases on the same attempt."""
+    """Refresh evidence and retain the tester for preserved manual results."""
     path = Path(output_path)
+    explicit_tester = tester is not None
+    tester = _configured_tester(tester)
     nodes, by_id = _state_case_index(state_path)
     current = _checklist({
-        "batch_id": batch_id, "workflow_type": workflow_type, "title": title, "tester": tester,
+        "batch_id": batch_id, "workflow_type": workflow_type, "title": title, "tester": tester or _DEFAULT_TESTER,
         "build_ref": build_ref, "updated_at": _now(),
         "cases": [_apply_state(case, nodes, by_id) if isinstance(case, dict) else case for case in cases],
     })
@@ -152,7 +161,7 @@ def init_qa_checklist(output_path, *, batch_id, cases, workflow_type="custom", t
         if preserve_existing and path.is_file():
             previous = _checklist(read_object(path))
             if previous["batch_id"] == current["batch_id"]:
-                if tester == "Daniel":
+                if tester is None:
                     current["tester"] = previous["tester"]
                 for key in ("title", "build_ref"):
                     if current[key] is None:
@@ -164,6 +173,9 @@ def init_qa_checklist(output_path, *, batch_id, cases, workflow_type="custom", t
                         prior[key] == case[key] for key in _CASE_IDENTITY
                     ):
                         case.update({key: prior[key] for key in _MANUAL_FIELDS})
+                        if not explicit_tester and (prior["manual_qa"] != "not_tested"
+                                                    or prior["gap_type"] is not None or prior["notes"] is not None):
+                            current["tester"] = previous["tester"]
                 if {**current, "updated_at": previous["updated_at"]} == previous:
                     return previous
         write_json(path, current, ensure_ascii=False)
@@ -182,9 +194,10 @@ def _record_results(checklist_path, results, tester=None):
             if case_id not in cases:
                 raise ValueError(f"Unknown QA case ID {case_id!r}")
             case = cases[case_id]
-            cases[case_id] = _normalize_case({
-                **case, **{key: result.get(key) for key in _MANUAL_FIELDS},
-            })
+            manual = {key: result.get(key) for key in _MANUAL_FIELDS}
+            if manual["manual_qa"] == case["manual_qa"] == "pass" and manual["resolved_on_attempt"] is None:
+                manual["resolved_on_attempt"] = case["resolved_on_attempt"]
+            cases[case_id] = _normalize_case({**case, **manual})
         updated = {**checklist, "cases": list(cases.values())}
         if tester is not None:
             updated["tester"] = _required_text(tester, "tester")
@@ -200,7 +213,7 @@ def record_qa_result(checklist_path, *, case_id, manual_qa, resolved_on_attempt=
     return _record_results(checklist_path, [{
         "case_id": case_id, "manual_qa": manual_qa, "resolved_on_attempt": resolved_on_attempt,
         "gap_type": gap_type, "notes": notes,
-    }], tester)
+    }], _configured_tester(tester))
 
 
 def _pct(numerator, denominator):

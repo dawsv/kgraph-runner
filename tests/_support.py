@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
 import runpy
 import struct
@@ -10,7 +11,7 @@ import sys
 from unittest.mock import patch
 import zlib
 
-from kgraph_runner import GraphFailure, GraphRunner
+SRC_DIR = str(Path(__file__).resolve().parents[1] / "src")
 
 
 def png_chunk(name, payload):
@@ -64,8 +65,11 @@ def run_workflow(test, root, name="workflow.py", *, status="passed", max_worker_
         "ctx": ctx or {}, "max_worker_calls": max_worker_calls,
         "builder_home": str(builder_home) if builder_home is not None else None,
     })
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join((SRC_DIR, existing_pythonpath)) if existing_pythonpath else SRC_DIR
     proc = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), name, options], cwd=root,
+        [sys.executable, str(Path(__file__).resolve()), name, options], cwd=root, env=env,
         capture_output=True, text=True, encoding="utf-8", timeout=30,
     )
     test.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -76,6 +80,8 @@ def run_workflow(test, root, name="workflow.py", *, status="passed", max_worker_
 
 
 def _run(name, options):
+    from kgraph_runner import GraphFailure, GraphRunner
+
     directory = Path.cwd() / ".kgraph"
     stem = Path(name).stem
     runner = GraphRunner(directory / f"{stem}_state.json", max_parallel_nodes=4,
@@ -101,4 +107,6 @@ def _run(name, options):
 
 
 if __name__ == "__main__":
+    if sys.path[0] != SRC_DIR:
+        sys.path.insert(0, SRC_DIR)
     _run(sys.argv[1], json.loads(sys.argv[2]))

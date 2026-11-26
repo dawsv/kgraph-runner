@@ -20,9 +20,11 @@ test_hash = hash_globs(
 
 Keep inputs under the root for fingerprints that survive moving the checkout. Pass `ignore_dirs` to replace the default set, or take the union to add exclusions. The defaults skip directory names such as `.git`, `.venv`, `node_modules`, `Library`, and `.kgraph`. Combine file hashes with any settings, tool versions, and other inputs that affect the result.
 
+Both helpers default to `use_cache=True`. They reuse file digests within the process when the resolved path, inode, size, and modification time match. They rehash recently modified files. Pass `use_cache=False` to read the file contents on every call, or call `clear_hash_cache()` to discard all cached digests.
+
 ## Run a build or test gate
 
-`shell_task` accepts an argument list or a string interpreted by the platform shell. Nonzero exits produce stable `exit_<code>` signatures. A timeout produces a `timeout` signature. The optional log receives stdout followed by stderr from the latest attempt, including any output captured before a timeout.
+`shell_task` accepts an argument list, a string interpreted by the platform shell, or a callable `command(ctx)` that returns either form for each attempt. Include the resolved command and other context-dependent inputs in the task fingerprint. Nonzero exits produce stable `exit_<code>` signatures. A timeout produces a `timeout` signature. When you set `log_path`, stdout and stderr stream into the same file as they arrive, and each attempt replaces the previous log.
 
 ```python
 import sys
@@ -47,9 +49,15 @@ GraphRunner(Path(".kgraph/test-state.json")).run([tests], {})
 
 For a build, declare the expected artifact in `outputs_fn` and use `verify_fn(ctx, completed_process)` to check it after exit zero. Return `(ok, signature, detail)` from a verifier. Use the same signature for the same cause and put variable diagnostics in the detail. The runner rechecks cached file outputs for changes.
 
+## Preview and observe execution
+
+`GraphRunner.plan()` previews one topological pass without running tasks or saving run state. Call it with the same nodes and context you would pass to `run()`. Task entries show `cached` or `will_run` and a reason such as `no_prior_state`, `input_hash_changed`, `missing_output:<path>`, or `output_hash_changed:<path>`. Plans use the current inputs and files, so results can change after an upstream task runs. Planning calls input hash, output path, and splitter callbacks on a shallow copy of the context. Keep those callbacks read-only. If a task's inputs are unavailable, its entry can report `inputs_unavailable`.
+
+Pass `on_event=callback` to `GraphRunner` to observe lifecycle events. The callback receives a dictionary with an `event` name, a UTC `timestamp`, and event fields such as the node path, attempt, or duration. Events include `run_start`, `run_end`, `node_start`, `node_cached`, `node_retry`, `node_passed`, `node_failed`, and `node_awaiting_subagents`. Callbacks can run concurrently during parallel execution. Keep them thread-safe and brief. The runner ignores callback exceptions.
+
 ## Pause for work or approval
 
-`subagent_gate` atomically writes the JSON returned by `packet_fn(ctx)` when a required artifact is missing or fails verification. Catch `GraphFailure` and inspect `awaiting_subagents` and `packet_path` to locate the request. Give the packet to the worker or reviewer, have them save the response at the requested path, then rerun the graph with the same state file.
+`subagent_gate` atomically writes the JSON returned by `packet_fn(ctx)` when a required artifact is missing or fails verification. Catch `GraphFailure` and check `awaiting_subagents`. Use `packet_paths` to find all waiting packets when multiple in-flight gates pause in parallel. `packet_path` still gives the first packet. Give each packet to its worker or reviewer, have them save the response at the requested path, then rerun the graph with the same state file.
 
 This example binds approval to the hash of an existing build artifact. The reviewer supplies a JSON object with `"approved": true` and the requested `"artifact_sha256"`.
 
@@ -94,7 +102,8 @@ try:
 except GraphFailure as exc:
     if not exc.awaiting_subagents:
         raise
-    print(f"Review request at {exc.packet_path}")
+    for packet in exc.packet_paths:
+        print(f"Review request at {packet}")
 ```
 
 A work packet can similarly include a task description, input revision, and paths for a report or generated files. Verify those artifacts and their revision before resuming dependent nodes. A successful gate caches its verified file outputs until the input hash changes or an output is removed or edited.

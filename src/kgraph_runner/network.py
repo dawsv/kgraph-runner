@@ -15,8 +15,10 @@ from threading import Thread
 from time import monotonic
 from typing import Dict, List, Optional
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+from ._files import valid_id
 
 
 _TAILSCALE_CGNAT = ip_network("100.64.0.0/10")
@@ -38,26 +40,31 @@ def _is_local_host(host):
 
 class _IngestRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Only send the snapshot and its credentials to the configured hub.
+        # Only send requests and their credentials to the configured hub.
         return None
+
+
+def _hub_endpoint(hub_url, path):
+    hub = urlsplit(hub_url)
+    if hub.scheme not in ("http", "https") or not hub.hostname or hub.username is not None:
+        raise ValueError("Hub URL must be an HTTP or HTTPS address")
+    handlers = [_IngestRedirectHandler()]
+    if _is_local_host(hub.hostname):
+        handlers.append(ProxyHandler({}))
+    endpoint = hub._replace(path=hub.path.rstrip("/") + path, fragment="").geturl()
+    return endpoint, build_opener(*handlers)
 
 
 def push_snapshot(hub_url, token, run, snapshot):
     """Send one workflow snapshot to the hub and return its registry entry."""
-    hub = urlsplit(hub_url)
-    if hub.scheme not in ("http", "https") or not hub.hostname or hub.username is not None:
-        raise ValueError("Hub URL must be an HTTP or HTTPS address")
-    endpoint = hub._replace(path=hub.path.rstrip("/") + "/api/ingest", fragment="").geturl()
+    endpoint, opener = _hub_endpoint(hub_url, "/api/ingest")
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     payload = json.dumps({"run": run, "snapshot": snapshot}, allow_nan=False).encode("utf-8")
     request = Request(endpoint, data=payload, headers=headers, method="POST")
-    handlers = [_IngestRedirectHandler()]
-    if _is_local_host(hub.hostname):
-        handlers.append(ProxyHandler({}))
     try:
-        with build_opener(*handlers).open(request, timeout=3) as response:
+        with opener.open(request, timeout=3) as response:
             result = json.load(response)
     except HTTPError as exc:
         exc.close()
@@ -67,6 +74,29 @@ def push_snapshot(hub_url, token, run, snapshot):
     if not isinstance(result, dict) or result.get("ok") is not True or not isinstance(result.get("run"), dict):
         raise ValueError("Hero Town Hub did not acknowledge the snapshot")
     return result["run"]
+
+
+def fetch_remote_response(hub_url: str, token: Optional[str], run_id: str) -> Optional[dict]:
+    """Read the Hub's queued decision for a run, if any."""
+    if (not valid_id(run_id) or len(run_id) > 128
+            or re.fullmatch(r"con|prn|aux|nul|(?:com|lpt)[0-9]", run_id, re.IGNORECASE)):
+        raise ValueError("Invalid run ID")
+    endpoint, opener = _hub_endpoint(hub_url, f"/api/runs/{quote(run_id, safe='')}/response")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    request = Request(endpoint, headers=headers, method="GET")
+    try:
+        with opener.open(request, timeout=3) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        exc.close()
+        if exc.code == 404:
+            return None
+        raise ValueError(f"Hero Town Hub returned HTTP {exc.code} {exc.reason}") from exc
+    except HTTPException as exc:
+        raise OSError(f"Invalid Hero Town Hub response: {exc}") from exc
+    if not isinstance(result, dict):
+        raise ValueError("Hero Town Hub response must be a JSON object")
+    return result
 
 
 def _command(*args):

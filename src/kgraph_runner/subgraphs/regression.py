@@ -8,7 +8,7 @@ from typing import List, Mapping, Optional, Sequence, Tuple, Union
 from .._files import read_object, require_id, write_json
 from ..engine import SubgraphNode, TaskNode
 from ..helpers import hash_globs, hash_paths, shell_task, subagent_gate
-from ..qa_metrics import init_qa_checklist, write_qa_scorecard
+from ..qa_metrics import _configured_tester, init_qa_checklist, write_qa_scorecard
 from ..verifiers import verify_png_file
 from ._common import files_hash, fingerprint
 from .bug_fix import Command, _command
@@ -56,7 +56,7 @@ def create_game_regression_subgraph(
     suite_id: str, *, work_dir: Path, repo_dir: Union[str, Path] = ".",
     build_cmd: Optional[Command] = None, test_cmd: Command, watch_globs: Sequence[str] = (),
     visual_checks: Sequence[VisualCheck] = (), min_width: int = 16, min_height: int = 16,
-    timeout_s: Optional[float] = None, deps: Tuple[str, ...] = (),
+    timeout_s: Optional[float] = None, deps: Tuple[str, ...] = (), tester: Optional[str] = None,
 ) -> SubgraphNode:
     """Run build and regression commands, then verify evidence in a suite-specific work directory."""
     suite_id = require_id(suite_id)
@@ -83,6 +83,8 @@ def create_game_regression_subgraph(
         raise ValueError("Visual check paths must be separate from generated workflow files")
     excluded = (*generated_paths, *visual_paths)
 
+    tester = _configured_tester(tester)
+    qa_config = (tester,) if tester is not None else ()
     settings = {
         "suite_id": suite_id, "repo_dir": str(repo_dir), "build_cmd": build_cmd, "test_cmd": test_cmd,
         "watch_globs": watch_globs, "visual_checks": checks, "timeout_s": timeout_s,
@@ -174,7 +176,7 @@ def create_game_regression_subgraph(
             "title": f"Visual check: {check['id']}", "kind": "visual", **automated,
         } for check in evidence)
         init_qa_checklist(qa_checklist, batch_id=suite_id, workflow_type="game-regression",
-                          title=f"Game regression for {suite_id}", cases=qa_cases,
+                          title=f"Game regression for {suite_id}", cases=qa_cases, tester=tester,
                           build_ref=fingerprint(preflight_data["source_hash"], preflight_data["config_hash"]))
         write_qa_scorecard(qa_checklist)
         write_json(json_report, {"suite_id": suite_id, "status": "passed", "preflight": preflight_data,
@@ -194,7 +196,7 @@ def create_game_regression_subgraph(
 
     nodes.append(TaskNode(
         id="regression_report", kind="code", run_fn=report, deps=(nodes[-1].id,),
-        input_hash_fn=lambda _ctx: fingerprint("qa-v1", files_hash((*report_inputs, *visual_paths))),
+        input_hash_fn=lambda _ctx: fingerprint("qa-v1", files_hash((*report_inputs, *visual_paths)), *qa_config),
         outputs_fn=lambda _ctx: (json_report, markdown_report),
     ))
     suite = SubgraphNode(id=suite_id, nodes=nodes, deps=deps)
@@ -206,11 +208,11 @@ def create_game_regression_graph(
     suite_id: str, *, work_dir: Path, repo_dir: Union[str, Path] = ".",
     build_cmd: Optional[Command] = None, test_cmd: Command, watch_globs: Sequence[str] = (),
     visual_checks: Sequence[VisualCheck] = (), min_width: int = 16, min_height: int = 16,
-    timeout_s: Optional[float] = None, deps: Tuple[str, ...] = (),
+    timeout_s: Optional[float] = None, deps: Tuple[str, ...] = (), tester: Optional[str] = None,
 ) -> List[SubgraphNode]:
     """Build a standalone game regression workflow."""
     return [create_game_regression_subgraph(
         suite_id, work_dir=work_dir, repo_dir=repo_dir, build_cmd=build_cmd, test_cmd=test_cmd,
         watch_globs=watch_globs, visual_checks=visual_checks, min_width=min_width, min_height=min_height,
-        timeout_s=timeout_s, deps=deps,
+        timeout_s=timeout_s, deps=deps, tester=tester,
     )]

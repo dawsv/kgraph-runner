@@ -1,13 +1,13 @@
 # KGraph Runner
 
-A Python runner for verified workflows. KGraph runs ordered and parallel steps, nests subgraphs, caches verified output, and retries individual failed steps with bounded repair loops. It has no runtime dependencies beyond Python 3.9 or later. The K is for Kippy.
+A Python runner for verified workflows. KGraph schedules DAG nodes as their dependencies finish, with optional parallel execution, nested subgraphs, verified output caching, and bounded repair loops. It has no runtime dependencies beyond Python 3.9 or later. The K is for Kippy.
 
 ## Install
 
-Install the public release wheel from GitHub. Pin a release version in each consuming project's dependencies.
+Install v0.2.0 in editable mode from this checkout. Pin a release version in each consuming project's dependencies.
 
 ```sh
-python -m pip install 'https://github.com/dawsv/kgraph-runner/releases/download/v0.1.1/kgraph_runner-0.1.1-py3-none-any.whl'
+python -m pip install -e .
 ```
 
 ## Run a workflow
@@ -49,12 +49,20 @@ The source tree includes [workflow helpers](src/kgraph_runner/helpers.py) for ha
 See [workflow patterns](docs/workflow-patterns.md) for reusable examples.
 See the [bug-fixing subgraph handoff](docs/bug-fixing-subgraph-handoff.md) for resumable desktop fixes, Histoury review and release, and game regression suites.
 
-- Use `kgraph-town` for live sub-task progress, drill-down, questions, and approvals. [Hero Town handoff](docs/hero-town-interactive-subgraph-handoff.md)
+## CLI and Hero Town
+
+`kgraph` and `kgraph-town` expose the same commands.
+
+- Use `run` to execute a workflow, `run --max-parallel N` to enable parallel siblings, and `plan` for a dry run with cache-miss reasons. Parallel gates can pause with multiple packets. Use `run --watch` to resume when a declared output appears or changes or a matching Hub response arrives.
+- Use `ui` for a single workflow, `hub` for multiple runs, and `render` for a self-contained HTML export. The live views receive server-sent events (SSE) and offer an Inspector log viewer and inline QA scorecards for local runs.
+- Use `push` to publish a snapshot and `pull-response` to retrieve a Hub decision. `run --hub-url` streams lifecycle snapshots as the run executes. Python integrations can observe lifecycle events through the runner's `on_event` hook.
+- Use `progress`, `ask`, and `answer` for sub-task updates and decisions, `qa` for manual results and scorecards, and `status` and `report` to inspect saved results.
+
+See the [Hero Town handoff](docs/hero-town-interactive-subgraph-handoff.md) for examples.
 
 ## Test
 
 ```sh
-python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 

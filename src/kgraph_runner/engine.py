@@ -2,14 +2,14 @@
 """
 Layer 0 — Portable, zero-dependency Python stdlib Loops-and-Graphs engine.
 
-Zero SmithShroom or Unity imports: copy this single file into any project.
+Zero SmithShroom or Unity imports.
 Primitives:
   - TaskNode          : atomic code/worker/verifier node with SHA-256 caching, timeout_s,
                         bounded make->verify->repair loop, and 2-same-cause circuit breaker
   - SubgraphNode      : nested child DAG treated as a single composable node (arbitrary depth)
   - LoopSubgraphNode  : wraps an ENTIRE multi-node subgraph in a bounded run->verify->repair loop
                         with targeted dirty-node invalidation and 2-same-cause circuit breaker
-  - SplitterNode      : parallel fan-out over items (each item builds a TaskNode or SubgraphNode)
+  - SplitterNode      : parallel fan-out over items (each item builds a node)
   - GraphRunner       : dependency-ordered execution, persisted graph_state.json,
                         max_worker_calls budget guard, --until & --retry-node
 """
@@ -21,9 +21,14 @@ import hashlib
 import json
 import threading
 import time
+from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass
+from graphlib import TopologicalSorter
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from ._files import file_lock, write_text
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -38,6 +43,12 @@ def sha256_json(obj: Any) -> str:
     return sha256_bytes(json.dumps(obj, sort_keys=True, default=str).encode("utf-8"))
 
 
+def _packet_paths(packet_path: Optional[str], packet_paths: Optional[Sequence[str]]) -> List[str]:
+    paths = [packet_path] if packet_path is not None else []
+    paths.extend(packet_paths or ())
+    return list(dict.fromkeys(str(path) for path in paths))
+
+
 class GraphFailure(RuntimeError):
     """Raised when a node/subgraph fails verification, hits timeout/budget, pauses for subagents, or trips the circuit breaker."""
 
@@ -50,6 +61,7 @@ class GraphFailure(RuntimeError):
         awaiting_subagents: bool = False,
         packet_path: Optional[str] = None,
         efficiency: Optional[Dict[str, int]] = None,
+        packet_paths: Optional[Sequence[str]] = None,
     ):
         super().__init__(f"[{node_path}] {reason}")
         self.node_path = node_path
@@ -57,7 +69,8 @@ class GraphFailure(RuntimeError):
         self.circuit_broken = circuit_broken
         self.budget_exceeded = budget_exceeded
         self.awaiting_subagents = awaiting_subagents
-        self.packet_path = packet_path
+        self.packet_paths: List[str] = _packet_paths(packet_path, packet_paths)
+        self.packet_path = self.packet_paths[0] if self.packet_paths else None
         self.efficiency = efficiency or {}
 
 
@@ -108,6 +121,53 @@ class SplitterNode:
     resource: Optional[str] = None
 
 
+def _raise_parallel_errors(path: str, errors: Sequence[Exception], group: str) -> None:
+    if not errors:
+        return
+    if len(errors) == 1:
+        raise errors[0]
+    summary = "; ".join(str(error) for error in errors)
+    awaiting = [error for error in errors if isinstance(error, GraphFailure) and error.awaiting_subagents]
+    if len(awaiting) == len(errors):
+        raise GraphFailure(
+            path,
+            summary,
+            awaiting_subagents=True,
+            packet_paths=[packet for error in awaiting for packet in error.packet_paths],
+        )
+    raise GraphFailure(path, f"{len(errors)} {group} failed: {summary}")
+
+
+def _node_kind(node: Any) -> str:
+    if isinstance(node, TaskNode):
+        return node.kind
+    if isinstance(node, SubgraphNode):
+        return "subgraph"
+    if isinstance(node, LoopSubgraphNode):
+        return "loop_subgraph"
+    if isinstance(node, SplitterNode):
+        return "splitter"
+    raise TypeError(f"Unsupported node type: {type(node)}")
+
+
+def _failure_status(error: BaseException) -> str:
+    if isinstance(error, GraphFailure):
+        if error.awaiting_subagents:
+            return "awaiting_subagents"
+        if error.circuit_broken:
+            return "circuit_broken"
+    return "failed"
+
+
+def _static_resources(node: Any) -> set[str]:
+    name = getattr(node, "resource", None)
+    resources = {str(name)} if name else set()
+    if isinstance(node, (SubgraphNode, LoopSubgraphNode)):
+        for child in node.nodes:
+            resources.update(_static_resources(child))
+    return resources
+
+
 class GraphRunner:
     def __init__(
         self,
@@ -118,6 +178,7 @@ class GraphRunner:
         max_worker_calls: Optional[int] = None,
         max_parallel_nodes: int = 1,
         logger: Callable[[str], None] = print,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self.state_path = Path(state_path)
         self.retry_nodes = set(retry_nodes)
@@ -128,12 +189,12 @@ class GraphRunner:
         self.worker_calls_used = 0
         self.efficiency = dict.fromkeys(("script_verifiers_passed", "agent_dispatches", "precheck_short_circuits"), 0)
         self._raw_logger = logger
+        self.on_event = on_event
         self._lock = threading.Lock()
         self._resource_locks: Dict[str, threading.RLock] = {}
         self.logger = self._log_safe
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         if self.state_path.exists():
-            self.state = json.loads(self.state_path.read_text())
+            self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
         else:
             self.state = {"version": 3, "nodes": {}}
         self.trace: List[Dict[str, Any]] = []
@@ -148,36 +209,62 @@ class GraphRunner:
     def _now(self) -> str:
         return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    def _save_state(self) -> None:
-        """Persist the state while the caller holds self._lock."""
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, indent=2) + "\n")
-        tmp.replace(self.state_path)
+    def _emit_event(self, name: str, **fields: Any) -> None:
+        """Notify observers outside self._lock. Task attempt numbers start at one."""
+        if self.on_event is not None:
+            with suppress(Exception):
+                self.on_event({"event": name, "timestamp": self._now(), **fields})
+
+    def _save_state(self, full_path: str) -> None:
+        """Persist a node update while the caller holds self._lock."""
+        state_path = self.state_path.resolve()
+        with file_lock(state_path.with_name(state_path.name + ".lock")):
+            if state_path.exists():
+                disk_state = json.loads(state_path.read_text(encoding="utf-8"))
+            else:
+                disk_state = self.state
+            state = {**self.state, **disk_state}
+            state["nodes"] = {**disk_state.get("nodes", {}), full_path: self.state["nodes"][full_path]}
+            write_text(state_path, json.dumps(state, indent=2) + "\n")
 
     def _should_retry(self, full_path: str, local_id: str) -> bool:
         if self.force:
             return True
-        if full_path in self.retry_nodes or local_id in self.retry_nodes:
-            return True
-        return any(full_path.startswith(pat + "/") for pat in self.retry_nodes)
+        with self._lock:
+            if full_path in self.retry_nodes or local_id in self.retry_nodes:
+                return True
+            return any(full_path.startswith(pat + "/") for pat in self.retry_nodes)
 
     def _is_fresh(self, full_path: str, local_id: str, in_hash: str, outputs: Sequence[Path]) -> bool:
+        return self._freshness_reason(full_path, local_id, in_hash, outputs)[0]
+
+    def _freshness_reason(
+        self, full_path: str, local_id: str, in_hash: str, outputs: Sequence[Path], cacheable: bool = True,
+    ) -> Tuple[bool, str]:
+        if not cacheable:
+            return False, "not_cacheable"
+        if self.force:
+            return False, "forced"
         if self._should_retry(full_path, local_id):
-            return False
+            return False, "retry_requested"
         with self._lock:
             rec = self.state.get("nodes", {}).get(full_path)
-        if not rec or rec.get("status") != "passed" or rec.get("input_hash") != in_hash:
-            return False
-        if not all(Path(p).exists() for p in outputs):
-            return False
+        if not rec:
+            return False, "no_prior_state"
+        if rec.get("status") != "passed":
+            return False, f"prior_status:{rec.get('status')}"
+        if rec.get("input_hash") != in_hash:
+            return False, "input_hash_changed"
+        for path in outputs:
+            if not Path(path).exists():
+                return False, f"missing_output:{path}"
         # Verify recorded output SHA-256 hashes when present so tampered/overwritten outputs invalidate cache
         saved_out_hashes = rec.get("output_hashes") or {}
-        for p in outputs:
-            sp = str(p)
-            expected_sha = saved_out_hashes.get(sp)
-            if expected_sha and Path(p).is_file() and sha256_file(Path(p)) != expected_sha:
-                return False
-        return True
+        for path in outputs:
+            expected_sha = saved_out_hashes.get(str(path))
+            if expected_sha and Path(path).is_file() and sha256_file(Path(path)) != expected_sha:
+                return False, f"output_hash_changed:{path}"
+        return True, "fresh"
 
     def _consume_worker_budget(self, full_path: str) -> None:
         with self._lock:
@@ -198,10 +285,19 @@ class GraphRunner:
         with self._lock:
             self.state.setdefault("nodes", {})[full_path] = entry
             self.trace.append({"node": full_path, **entry})
-            self._save_state()
+            self._save_state(full_path)
+
+    @staticmethod
+    def _nodes_by_id(nodes: Sequence[Any]) -> Dict[str, Any]:
+        by_id = {}
+        for node in nodes:
+            if node.id in by_id:
+                raise ValueError(f"Duplicate node ID '{node.id}'")
+            by_id[node.id] = node
+        return by_id
 
     def topo_sort(self, nodes: Sequence[Any]) -> List[Any]:
-        by_id = {n.id: n for n in nodes}
+        by_id = self._nodes_by_id(nodes)
         visited: Dict[str, int] = {}
         ordered: List[Any] = []
 
@@ -224,7 +320,9 @@ class GraphRunner:
             dfs(n.id)
         return ordered
 
-    def _resolve_until_path(self, root_nodes: Sequence[Any], prefix: str) -> Optional[str]:
+    def _resolve_until_path(
+        self, root_nodes: Sequence[Any], prefix: str, *, validate_topology: bool = False,
+    ) -> Optional[str]:
         requested = self.until
         if requested is None:
             return None
@@ -234,6 +332,8 @@ class GraphRunner:
         stages: Dict[str, Any] = {}
 
         def visit(nodes, parent_path):
+            if validate_topology:
+                self.topo_sort(nodes)
             for node in nodes:
                 path = f"{parent_path}/{node.id}" if parent_path else node.id
                 if path in stages:
@@ -262,9 +362,70 @@ class GraphRunner:
         self.reached_path = None
         self.last_completed_stage = None
         self._until_path = None
-        self._until_path = self._resolve_until_path(root_nodes, prefix)
-        self._run_nodes(root_nodes, ctx, prefix)
+        self._emit_event("run_start", status="running", error="")
+        try:
+            self._until_path = self._resolve_until_path(root_nodes, prefix)
+            self._run_nodes(root_nodes, ctx, prefix)
+        except BaseException as exc:
+            status = _failure_status(exc)
+            if status == "failed" and isinstance(exc, GraphFailure) and exc.budget_exceeded:
+                status = "budget_exceeded"
+            self._emit_event("run_end", status=status, error=str(exc) or type(exc).__name__)
+            raise
+        self._emit_event("run_end", status="stopped" if self.reached_path is not None else "passed", error="")
         return ctx
+
+    def plan(self, root_nodes: Sequence[Any], ctx: Dict[str, Any], prefix: str = "") -> List[Dict[str, Any]]:
+        """Preview one topological pass using the supplied inputs and existing artifacts.
+
+        Metadata and splitter callbacks run against a shallow context copy. They
+        should be read-only. Missing inputs can leave task freshness or the
+        contents of a dynamic splitter unknown until execution.
+        """
+        until_path = self._resolve_until_path(root_nodes, prefix, validate_topology=True)
+        plan_ctx = ctx.copy()
+        entries: List[Dict[str, Any]] = []
+
+        def visit(nodes: Sequence[Any], parent_path: str) -> bool:
+            for node in nodes:
+                path = f"{parent_path}/{node.id}" if parent_path else node.id
+                entry = {
+                    "path": path,
+                    "id": node.id,
+                    "node_type": type(node).__name__,
+                    "kind": _node_kind(node),
+                    "deps": list(getattr(node, "deps", ())),
+                    "resource": getattr(node, "resource", None),
+                    "status": "container",
+                    "reason": None,
+                }
+                entries.append(entry)
+                if isinstance(node, TaskNode):
+                    try:
+                        fresh, reason = self._freshness_reason(
+                            path, node.id, node.input_hash_fn(plan_ctx), list(node.outputs_fn(plan_ctx)), node.cacheable,
+                        )
+                    except (FileNotFoundError, KeyError) as exc:
+                        fresh, reason = False, "inputs_unavailable"
+                        entry["detail"] = str(exc)
+                    entry.update(status="cached" if fresh else "will_run", reason=reason)
+                elif isinstance(node, (SubgraphNode, LoopSubgraphNode)):
+                    if visit(self.topo_sort(node.nodes), path):
+                        return True
+                elif isinstance(node, SplitterNode):
+                    try:
+                        children = self._build_splitter_children(node, plan_ctx)
+                    except (FileNotFoundError, KeyError) as exc:
+                        entry["detail"] = str(exc)
+                    else:
+                        if visit(children, path):
+                            return True
+                if path == until_path:
+                    return True
+            return False
+
+        visit(self.topo_sort(root_nodes), prefix)
+        return entries
 
     def _get_resource_lock(self, name: str) -> threading.RLock:
         with self._lock:
@@ -281,14 +442,27 @@ class GraphRunner:
         ctx: Dict[str, Any],
         *,
         track_stages: bool,
-        in_exclusive_resource: bool = False,
+        held_resources: Tuple[str, ...] = (),
     ) -> None:
-        res_name = getattr(node, "resource", None)
-        lock = self._get_resource_lock(str(res_name)) if res_name else None
-        child_exclusive = in_exclusive_resource or (lock is not None)
-        if lock is not None:
-            lock.acquire()
+        kind = _node_kind(node)
+        # Resource-free containers can still run their children in parallel.
+        # Exclusive containers reserve their static subtree in one order before it runs.
+        resources = _static_resources(node) if getattr(node, "resource", None) else set()
+        child_resources = tuple(sorted(resources.union(held_resources)))
+        acquired = []
         try:
+            for name in sorted(resources.difference(held_resources)):
+                lock = self._get_resource_lock(name)
+                # Runtime splitter children can introduce a resource absent from
+                # the static subtree. Never wait for it in reverse order.
+                ordered = not held_resources or name > held_resources[-1]
+                if not lock.acquire(blocking=ordered):
+                    raise GraphFailure(full_path, f"Cannot wait for resource {name!r} while holding {held_resources[-1]!r}")
+                acquired.append(lock)
+            simple_container = isinstance(node, (SubgraphNode, SplitterNode))
+            if simple_container:
+                started = time.monotonic()
+                self._emit_event("node_start", node=full_path, kind=kind, attempt=1)
             if isinstance(node, TaskNode):
                 self._run_task(node, full_path, ctx)
             elif isinstance(node, SubgraphNode):
@@ -298,7 +472,7 @@ class GraphRunner:
                     ctx,
                     full_path,
                     track_stages=track_stages,
-                    allow_parallel=not child_exclusive,
+                    held_resources=child_resources,
                 )
                 if self.reached_path is not None:
                     return
@@ -309,43 +483,36 @@ class GraphRunner:
                     full_path,
                     ctx,
                     track_stages=track_stages,
-                    allow_parallel=not child_exclusive,
+                    held_resources=child_resources,
                 )
                 if self.reached_path is not None:
                     return
             elif isinstance(node, SplitterNode):
-                self._run_splitter(node, full_path, ctx)
-            else:
-                raise TypeError(f"Unsupported node type: {type(node)}")
+                self._run_splitter(node, full_path, ctx, held_resources=child_resources)
+
+            if simple_container:
+                self._emit_event(
+                    "node_passed", node=full_path, kind=kind, attempts=1,
+                    duration_s=round(time.monotonic() - started, 3), cache_miss_reason=None,
+                )
 
             if track_stages:
                 with self._lock:
                     self.last_completed_stage = full_path
                     if full_path == self._until_path:
                         self.reached_path = full_path
+        except Exception as exc:
+            failure = exc if isinstance(exc, GraphFailure) else None
+            self._emit_event(
+                f"node_{_failure_status(exc)}", node=full_path, kind=kind,
+                detail=failure.reason if failure else str(exc),
+                packet_path=failure.packet_path if failure else None,
+                packet_paths=list(failure.packet_paths) if failure else [],
+            )
+            raise
         finally:
-            if lock is not None:
+            for lock in reversed(acquired):
                 lock.release()
-
-    def _topo_waves(self, nodes: Sequence[Any]) -> List[List[Any]]:
-        ordered = self.topo_sort(nodes)
-        by_id = {n.id: n for n in ordered}
-        order_idx = {n.id: i for i, n in enumerate(ordered)}
-        remaining = set(by_id)
-        done = set()
-        waves: List[List[Any]] = []
-        while remaining:
-            ready = [
-                by_id[nid]
-                for nid in remaining
-                if all(d in done for d in getattr(by_id[nid], "deps", ()))
-            ]
-            ready.sort(key=lambda n: order_idx[n.id])
-            waves.append(ready)
-            for n in ready:
-                remaining.remove(n.id)
-                done.add(n.id)
-        return waves
 
     def _run_nodes(
         self,
@@ -354,86 +521,109 @@ class GraphRunner:
         prefix: str,
         *,
         track_stages: bool = True,
-        allow_parallel: bool = True,
+        held_resources: Tuple[str, ...] = (),
     ) -> None:
+        ordered = self.topo_sort(nodes)
         # Keep deterministic sequential order whenever --until is active, max_parallel_nodes == 1, or inside an exclusive resource.
-        if not allow_parallel or self.max_parallel_nodes <= 1 or self._until_path is not None:
-            for node in self.topo_sort(nodes):
+        if held_resources or self.max_parallel_nodes <= 1 or self._until_path is not None:
+            for node in ordered:
                 full_path = f"{prefix}/{node.id}" if prefix else node.id
                 self._execute_single_node(
                     node,
                     full_path,
                     ctx,
                     track_stages=track_stages,
-                    in_exclusive_resource=not allow_parallel,
+                    held_resources=held_resources,
                 )
                 if self.reached_path is not None:
                     return
             return
 
-        for wave in self._topo_waves(nodes):
-            if len(wave) == 1:
-                node = wave[0]
-                full_path = f"{prefix}/{node.id}" if prefix else node.id
-                self._execute_single_node(node, full_path, ctx, track_stages=track_stages)
-                continue
-
-            self.logger(
-                f"[wave:parallel] {prefix or 'root'} ({len(wave)} sibling(s): "
-                f"{', '.join(n.id for n in wave)}, max_parallel={self.max_parallel_nodes})"
-            )
-            errors: List[Exception] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_parallel_nodes, len(wave))) as ex:
-                futs = [
-                    ex.submit(
+        if not ordered:
+            return
+        by_id = {node.id: node for node in ordered}
+        sorter = TopologicalSorter({node.id: getattr(node, "deps", ()) for node in ordered})
+        sorter.prepare()
+        ready = deque(sorter.get_ready())
+        active: Dict[concurrent.futures.Future, str] = {}
+        errors: Dict[str, Exception] = {}
+        max_workers = min(self.max_parallel_nodes, len(ordered))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # A failure blocks new submissions while the in-flight siblings finish.
+            while active or (ready and not errors):
+                while ready and not errors and len(active) < max_workers:
+                    node_id = ready.popleft()
+                    future = executor.submit(
                         self._execute_single_node,
-                        node,
-                        f"{prefix}/{node.id}" if prefix else node.id,
+                        by_id[node_id],
+                        f"{prefix}/{node_id}" if prefix else node_id,
                         ctx,
                         track_stages=track_stages,
                     )
-                    for node in wave
-                ]
-                for fut in concurrent.futures.as_completed(futs):
+                    active[future] = node_id
+                completed, _ = concurrent.futures.wait(active, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in completed:
+                    node_id = active.pop(future)
                     try:
-                        fut.result()
+                        future.result()
                     except Exception as exc:
-                        errors.append(exc)
-            if errors:
-                if len(errors) == 1:
-                    raise errors[0]
-                awaiting = [e for e in errors if isinstance(e, GraphFailure) and e.awaiting_subagents]
-                if len(awaiting) == len(errors):
-                    raise GraphFailure(
-                        prefix or "root",
-                        "; ".join(str(e) for e in awaiting),
-                        awaiting_subagents=True,
-                        packet_path=awaiting[0].packet_path,
-                    )
-                raise GraphFailure(prefix or "root", f"{len(errors)} parallel sibling(s) failed: " + "; ".join(str(e) for e in errors))
+                        errors[node_id] = exc
+                    else:
+                        sorter.done(node_id)
+                ready.extend(sorter.get_ready())
+        _raise_parallel_errors(
+            prefix or "root", [errors[node_id] for node_id in by_id if node_id in errors], "parallel sibling(s)",
+        )
 
     def _invoke_with_timeout(self, fn: Callable, args: tuple, timeout_s: Optional[float]):
         if timeout_s is None:
             return fn(*args)
-        ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        fut = ex.submit(fn, *args)
-        try:
-            return fut.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError:
-            ex.shutdown(wait=False, cancel_futures=True)
+        result: Any = None
+        error: Optional[BaseException] = None
+
+        def invoke() -> None:
+            nonlocal result, error
+            try:
+                result = fn(*args)
+            except BaseException as exc:
+                error = exc
+
+        thread = threading.Thread(target=invoke, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout_s)
+        if thread.is_alive():
             raise TimeoutError(f"exceeded timeout_s={timeout_s}s")
-        else:
-            ex.shutdown(wait=False)
+        if error is not None:
+            raise error
+        return result
 
     def _run_task(self, node: TaskNode, full_path: str, ctx: Dict[str, Any]) -> None:
         t0 = time.monotonic()
         in_hash = node.input_hash_fn(ctx)
         outputs = list(node.outputs_fn(ctx))
-        if node.cacheable and self._is_fresh(full_path, node.id, in_hash, outputs):
+        fresh, miss_reason = self._freshness_reason(full_path, node.id, in_hash, outputs, node.cacheable)
+        if fresh:
             self.logger(f"[graph:cached] {full_path}")
             with self._lock:
                 self.trace.append({"node": full_path, "status": "cached", "input_hash": in_hash})
+            self._emit_event("node_cached", node=full_path, kind=node.kind, input_hash=in_hash)
             return
+
+        task_fields = {
+            "kind": node.kind, "input_hash": in_hash, "cache_miss_reason": miss_reason,
+            "outputs": [str(p) for p in outputs],
+        }
+
+        def record_callback_failure(attempt, exc):
+            self._record(full_path, {
+                **task_fields,
+                "status": "failed",
+                "attempts": attempt + 1,
+                "duration_s": round(time.monotonic() - t0, 3),
+                "error_signature": f"exception:{type(exc).__name__}",
+                "detail": str(exc) or type(exc).__name__,
+                "updated_at": self._now(),
+            })
 
         prev_err_sig: Optional[str] = None
         last_detail = ""
@@ -443,14 +633,14 @@ class GraphRunner:
             started_at = self._now()
             with self._lock:
                 self.state.setdefault("nodes", {})[full_path] = {
-                    "kind": node.kind,
+                    **task_fields,
                     "status": "running",
-                    "input_hash": in_hash,
                     "attempts": attempt,
                     "started_at": started_at,
                     "updated_at": started_at,
                 }
-                self._save_state()
+                self._save_state(full_path)
+            self._emit_event("node_start", node=full_path, kind=node.kind, attempt=attempt + 1)
             try:
                 result = self._invoke_with_timeout(node.run_fn, (ctx, attempt), node.timeout_s)
                 if node.verify_fn is not None:
@@ -463,15 +653,13 @@ class GraphRunner:
                 ok, err_sig, detail = False, "timeout", str(exc)
             except GraphFailure as exc:
                 self._count_efficiency(exc.efficiency)
-                status = "awaiting_subagents" if exc.awaiting_subagents else (
-                    "circuit_broken" if exc.circuit_broken else "failed"
-                )
                 self._record(full_path, {
-                    "kind": node.kind,
-                    "status": status,
-                    "input_hash": in_hash,
+                    **task_fields,
+                    "status": _failure_status(exc),
                     "attempts": attempt + 1,
                     "detail": exc.reason,
+                    "packet_path": exc.packet_path,
+                    "packet_paths": list(exc.packet_paths),
                     "updated_at": self._now(),
                 })
                 raise
@@ -479,16 +667,21 @@ class GraphRunner:
                 ok, err_sig, detail = False, f"exception:{type(exc).__name__}", str(exc)
 
             if ok:
+                try:
+                    out_list = list(node.outputs_fn(ctx))
+                    out_paths = [str(p) for p in out_list]
+                    out_hashes = {str(p): sha256_file(Path(p)) for p in out_list if Path(p).is_file()}
+                    final_input_hash = node.input_hash_fn(ctx)
+                except BaseException as exc:
+                    record_callback_failure(attempt, exc)
+                    raise
                 if node.kind == "verifier":
                     self._count_efficiency({"script_verifiers_passed": 1})
                 dur = round(time.monotonic() - t0, 3)
-                out_list = list(node.outputs_fn(ctx))
-                out_paths = [str(p) for p in out_list]
-                out_hashes = {str(p): sha256_file(Path(p)) for p in out_list if Path(p).is_file()}
                 self._record(full_path, {
-                    "kind": node.kind,
+                    **task_fields,
                     "status": "passed",
-                    "input_hash": node.input_hash_fn(ctx),
+                    "input_hash": final_input_hash,
                     "attempts": attempt + 1,
                     "duration_s": dur,
                     "detail": detail,
@@ -501,15 +694,18 @@ class GraphRunner:
                     self.retry_nodes.discard(full_path)
                     self.retry_nodes.discard(node.id)
                 self.logger(f"[graph:ran]    {full_path} (attempts={attempt + 1}, {dur:.2f}s) — {detail}")
+                self._emit_event(
+                    "node_passed", node=full_path, kind=node.kind, attempts=attempt + 1,
+                    duration_s=dur, cache_miss_reason=miss_reason,
+                )
                 return
 
             last_detail = detail
             if prev_err_sig is not None and err_sig == prev_err_sig:
                 dur = round(time.monotonic() - t0, 3)
                 self._record(full_path, {
-                    "kind": node.kind,
+                    **task_fields,
                     "status": "circuit_broken",
-                    "input_hash": in_hash,
                     "attempts": attempt + 1,
                     "duration_s": dur,
                     "error_signature": err_sig,
@@ -522,14 +718,21 @@ class GraphRunner:
             prev_err_sig = err_sig
             if attempt < node.max_retries:
                 self.logger(f"[graph:retry]  {full_path} attempt {attempt + 1} failed ({err_sig}): {detail}")
+                self._emit_event(
+                    "node_retry", node=full_path, kind=node.kind, attempt=attempt + 1,
+                    error_signature=err_sig, detail=detail,
+                )
                 if node.repair_fn is not None:
-                    node.repair_fn(ctx, attempt + 1, err_sig, detail)
+                    try:
+                        node.repair_fn(ctx, attempt + 1, err_sig, detail)
+                    except BaseException as exc:
+                        record_callback_failure(attempt, exc)
+                        raise
 
         dur = round(time.monotonic() - t0, 3)
         self._record(full_path, {
-            "kind": node.kind,
+            **task_fields,
             "status": "failed",
-            "input_hash": in_hash,
             "attempts": node.max_retries + 1,
             "duration_s": dur,
             "error_signature": prev_err_sig,
@@ -546,14 +749,15 @@ class GraphRunner:
         ctx: Dict[str, Any],
         *,
         track_stages: bool,
-        allow_parallel: bool = True,
+        held_resources: Tuple[str, ...] = (),
     ) -> None:
         t0 = time.monotonic()
         prev_err_sig: Optional[str] = None
         last_detail = ""
         for attempt in range(node.max_retries + 1):
             self.logger(f"[loop_sg:iter] {full_path} (attempt {attempt + 1}/{node.max_retries + 1})")
-            self._run_nodes(node.nodes, ctx, full_path, track_stages=track_stages, allow_parallel=allow_parallel)
+            self._emit_event("node_start", node=full_path, kind="loop_subgraph", attempt=attempt + 1)
+            self._run_nodes(node.nodes, ctx, full_path, track_stages=track_stages, held_resources=held_resources)
             if self.reached_path is not None:
                 return
             ok, err_sig, detail = node.verify_fn(ctx)
@@ -568,6 +772,10 @@ class GraphRunner:
                     "updated_at": self._now(),
                 })
                 self.logger(f"[loop_sg:PASS] {full_path} (attempts={attempt + 1}, {dur:.2f}s) — {detail}")
+                self._emit_event(
+                    "node_passed", node=full_path, kind="loop_subgraph", attempts=attempt + 1,
+                    duration_s=dur, cache_miss_reason=None,
+                )
                 return
 
             last_detail = detail
@@ -588,6 +796,10 @@ class GraphRunner:
             prev_err_sig = err_sig
             if attempt < node.max_retries:
                 self.logger(f"[loop_sg:rtry] {full_path} attempt {attempt + 1} failed ({err_sig}): {detail}")
+                self._emit_event(
+                    "node_retry", node=full_path, kind="loop_subgraph", attempt=attempt + 1,
+                    error_signature=err_sig, detail=detail,
+                )
                 if node.repair_fn is not None:
                     dirty_paths = node.repair_fn(ctx, attempt + 1, err_sig, detail) or ()
                     with self._lock:
@@ -612,12 +824,18 @@ class GraphRunner:
         overall_status: str = "passed",
         error: str = "",
         packet_path: Optional[str] = None,
+        packet_paths: Optional[Sequence[str]] = None,
     ) -> Path:
         """Emit structured run_report.json telemetry for objective Failure Classification & Graph Evolution."""
         out_p = Path(report_path) if report_path else self.state_path.with_name(self.state_path.stem.replace("graph_state", "run_report") + ".json")
         with self._lock:
             trace_copy = list(self.trace)
             efficiency = dict(self.efficiency)
+            worker_calls_used = self.worker_calls_used
+            reached_path = self.reached_path
+            last_completed_stage = self.last_completed_stage
+        latest = {event["node"]: event["status"] for event in trace_copy}
+        packets = _packet_paths(packet_path, packet_paths)
         cached = sum(1 for t in trace_copy if t.get("status") == "cached")
         passed = sum(1 for t in trace_copy if t.get("status") == "passed")
         failed = sum(1 for t in trace_copy if t.get("status") == "failed")
@@ -641,19 +859,21 @@ class GraphRunner:
 
         report = {
             "version": 1,
-            "status": "stopped" if overall_status == "passed" and self.reached_path is not None else overall_status,
+            "status": "stopped" if overall_status == "passed" and reached_path is not None else overall_status,
             "error": error,
             "awaiting_subagents": overall_status == "awaiting_subagents",
-            "packet_path": packet_path,
+            "packet_path": packets[0] if packets else None,
+            "packet_paths": packets,
+            "cached_nodes": [node for node, status in latest.items() if status == "cached"],
             "requested_until": self.until,
             "requested_path": self._until_path,
-            "reached_path": self.reached_path,
-            "last_completed_stage": self.last_completed_stage,
+            "reached_path": reached_path,
+            "last_completed_stage": last_completed_stage,
             "generated_at": self._now(),
             "state_file": str(self.state_path),
             "scope": {
                 "requested_until": self.until,
-                "stop_reached": self.reached_path is not None,
+                "stop_reached": reached_path is not None,
                 "reached_nodes": list(dict.fromkeys(event["node"] for event in trace_copy)),
             },
             "summary": {
@@ -663,7 +883,7 @@ class GraphRunner:
                 "failed": failed,
                 "circuit_broken": broken,
                 "retried_nodes": retried,
-                "worker_calls_used": self.worker_calls_used,
+                "worker_calls_used": worker_calls_used,
                 "max_worker_calls": self.max_worker_calls,
                 **efficiency,
             },
@@ -671,44 +891,37 @@ class GraphRunner:
             "slowest_nodes": timed,
             "evolution_hints": hints,
         }
-        out_p.parent.mkdir(parents=True, exist_ok=True)
-        out_p.write_text(json.dumps(report, indent=2) + "\n")
+        write_text(out_p, json.dumps(report, indent=2) + "\n")
         return out_p
 
-    def _run_splitter(self, node: SplitterNode, full_path: str, ctx: Dict[str, Any]) -> None:
-        items = list(node.items_fn(ctx))
-        children = [node.child_builder_fn(item, ctx) for item in items]
+    def _build_splitter_children(self, node: SplitterNode, ctx: Dict[str, Any]) -> List[Any]:
+        children = [node.child_builder_fn(item, ctx) for item in list(node.items_fn(ctx))]
+        self._nodes_by_id(children)
+        return children
+
+    def _run_splitter(
+        self, node: SplitterNode, full_path: str, ctx: Dict[str, Any], *, held_resources: Tuple[str, ...] = (),
+    ) -> None:
+        children = self._build_splitter_children(node, ctx)
         self.logger(f"[splitter]     {full_path} ({len(children)} branch(es), workers={node.max_workers})")
 
         def exec_child(child):
-            child_path = f"{full_path}/{child.id}"
-            if isinstance(child, TaskNode):
-                self._run_task(child, child_path, ctx)
-            elif isinstance(child, SubgraphNode):
-                self._run_nodes(child.nodes, ctx, child_path, track_stages=False)
-            elif isinstance(child, LoopSubgraphNode):
-                self._run_loop_subgraph(child, child_path, ctx, track_stages=False)
-            else:
-                raise TypeError(f"Splitter child must be TaskNode/SubgraphNode/LoopSubgraphNode, got {type(child)}")
+            self._execute_single_node(
+                child, f"{full_path}/{child.id}", ctx, track_stages=False, held_resources=held_resources,
+            )
 
-        if node.max_workers <= 1 or len(children) <= 1:
-            for ch in children:
-                exec_child(ch)
+        # Descendants must stay on the thread that owns the reserved resources.
+        if held_resources or node.max_workers <= 1 or len(children) <= 1:
+            for child in children:
+                exec_child(child)
             return
 
         errors = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=node.max_workers) as ex:
-            futs = [ex.submit(exec_child, ch) for ch in children]
-            for fut in concurrent.futures.as_completed(futs):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=node.max_workers) as executor:
+            futures = [executor.submit(exec_child, child) for child in children]
+            for future in futures:
                 try:
-                    fut.result()
+                    future.result()
                 except Exception as exc:
                     errors.append(exc)
-        if errors:
-            if len(errors) == 1:
-                raise errors[0]
-            summary = "; ".join(str(e) for e in errors)
-            awaiting = [e for e in errors if isinstance(e, GraphFailure) and e.awaiting_subagents]
-            if len(awaiting) == len(errors):
-                raise GraphFailure(full_path, summary, awaiting_subagents=True, packet_path=awaiting[0].packet_path)
-            raise GraphFailure(full_path, f"{len(errors)} splitter branch(es) failed: {summary}")
+        _raise_parallel_errors(full_path, errors, "splitter branch(es)")
