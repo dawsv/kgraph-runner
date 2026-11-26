@@ -1,7 +1,7 @@
 //! Literal-argv agent workers with deterministic verification and optional evaluator retries.
 
 use crate::files::write_text;
-use crate::repair::redact_secrets;
+use crate::repair::{compact_feedback, redact_secrets};
 use crate::shell::{run_command_streaming, CommandSpec};
 use crate::types::{
     AgentUsage, Context, EfficiencyCounts, InputHashFn, OutputsFn, TaskKind, TaskNode, TaskResult,
@@ -67,6 +67,7 @@ pub struct AgentTaskOptions {
     pub response_output_path: Option<PathBuf>,
     pub timeout_s: Option<f64>,
     pub max_retries: usize,
+    pub max_feedback_bytes: Option<usize>,
     pub deps: Vec<String>,
     pub resource: Option<String>,
     pub cacheable: bool,
@@ -96,6 +97,7 @@ impl AgentTaskOptions {
             response_output_path: None,
             timeout_s: None,
             max_retries: 0,
+            max_feedback_bytes: None,
             deps: vec![],
             resource: None,
             cacheable: true,
@@ -567,12 +569,14 @@ fn attempt(
         }
     }
     let node_path = crate::engine::active_node_path().unwrap_or_else(|| opts.id.clone());
+    let feedback_limit = opts.max_feedback_bytes.unwrap_or(16 * 1024);
     for (key, title) in [
         ("__kgraph_repair", "Repair context"),
         (FEEDBACK, "Prior evaluator critique"),
     ] {
         if let Some(context) = ctx.get(key).and_then(|v| v.get(&node_path).cloned()) {
-            prompt.push_str(&format!("\n\n{title}:\n{context}"));
+            let rendered = compact_feedback(&context.to_string(), feedback_limit);
+            prompt.push_str(&format!("\n\n{title}:\n{rendered}"));
         }
     }
 

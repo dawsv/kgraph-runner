@@ -508,6 +508,82 @@ impl Drop for IsolatedWorktree {
     }
 }
 
+/// Summary of an orphaned `.kgraph` worktree discovered or removed by [`prune_orphaned_worktrees`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedWorktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub removed: bool,
+}
+
+/// Discover and optionally remove Git worktrees rooted under `worktree_base`
+/// (e.g. `.kgraph/worktrees`) left behind by crashed or cancelled runs.
+pub fn prune_orphaned_worktrees(
+    repo_root: &Path,
+    worktree_base: &Path,
+    dry_run: bool,
+) -> Result<Vec<PrunedWorktree>, String> {
+    let root = canonical(repo_root)?;
+    let base_abs = if worktree_base.is_absolute() {
+        worktree_base.to_path_buf()
+    } else {
+        root.join(worktree_base)
+    };
+    let base = canonical(&base_abs).unwrap_or(base_abs);
+    if !dry_run {
+        let _ = run(git(&root).args(["worktree", "prune"]));
+    }
+    let out = run(git(&root).args(["worktree", "list", "--porcelain"]))?;
+    let listing = String::from_utf8_lossy(&out);
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+    let mut entries: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for line in listing.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(p) = current_path.take() {
+                entries.push((p, current_branch.take()));
+            }
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("worktree ") {
+            current_path = Some(PathBuf::from(raw.trim()));
+        } else if let Some(raw) = line.strip_prefix("branch ") {
+            current_branch = Some(
+                raw.trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(raw.trim())
+                    .to_owned(),
+            );
+        }
+    }
+    let mut pruned = Vec::new();
+    for (wt_path, branch) in entries {
+        let resolved = canonical(&wt_path).unwrap_or_else(|_| git_arg(&wt_path));
+        if resolved == root || !resolved.starts_with(&base) {
+            continue;
+        }
+        let mut removed = false;
+        if !dry_run {
+            run(git(&root)
+                .args(["worktree", "remove", "--force"])
+                .arg(git_arg(&resolved)))?;
+            if let Some(ref b) = branch {
+                let _ = run(git(&root).args(["branch", "-D", b]));
+            }
+            removed = true;
+        }
+        pruned.push(PrunedWorktree {
+            path: resolved,
+            branch,
+            removed,
+        });
+    }
+    if !dry_run {
+        let _ = run(git(&root).args(["worktree", "prune"]));
+    }
+    Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +911,32 @@ mod tests {
         fs::write(path.join("user-file"), "safe").unwrap();
         assert!(IsolatedWorktree::create(spec).is_err());
         assert_eq!(fs::read_to_string(path.join("user-file")).unwrap(), "safe");
+        assert_eq!(f.count(), 1);
+    }
+
+    #[test]
+    fn prune_orphaned_worktrees_supports_dry_run_and_removal() {
+        let f = Fixture::new();
+        let mut spec = f.spec("orphan", MergePolicy::None);
+        spec.worktree_base = ".kgraph/worktrees".into();
+        spec.keep_on_failure = true;
+        let tree = IsolatedWorktree::create(spec).unwrap();
+        let wt_path = tree.path().to_owned();
+        let _ = tree.finish(false, None).unwrap();
+        assert!(wt_path.exists());
+        assert_eq!(f.count(), 2);
+
+        let preview =
+            prune_orphaned_worktrees(&f.repo, Path::new(".kgraph/worktrees"), true).unwrap();
+        assert_eq!(preview.len(), 1);
+        assert!(!preview[0].removed);
+        assert!(wt_path.exists());
+
+        let cleaned =
+            prune_orphaned_worktrees(&f.repo, Path::new(".kgraph/worktrees"), false).unwrap();
+        assert_eq!(cleaned.len(), 1);
+        assert!(cleaned[0].removed);
+        assert!(!wt_path.exists());
         assert_eq!(f.count(), 1);
     }
 }

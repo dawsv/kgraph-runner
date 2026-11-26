@@ -20,16 +20,30 @@ use kgraph_core::verifiers::verify_png_file;
 use kgraph_core::worktree::{IsolatedWorktree, MergePolicy, WorktreeSpec};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowBudgets {
+    #[serde(default)]
+    pub max_worker_calls: Option<usize>,
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub max_wall_time_s: Option<f64>,
+}
+
 pub struct LoadedWorkflow {
     pub title: Option<String>,
     pub nodes: Vec<Node>,
+    pub finally_nodes: Vec<Node>,
+    pub budgets: WorkflowBudgets,
     pub context: Context,
     pub qa_checklist_path: Option<PathBuf>,
 }
@@ -590,6 +604,7 @@ impl Spec<'_> {
         opts.env = self.or("env", BTreeMap::new())?;
         opts.timeout_s = self.or("timeout_s", None)?;
         opts.max_retries = self.or("max_retries", 0)?;
+        opts.max_feedback_bytes = self.or("max_feedback_bytes", None)?;
         opts.deps = self.strings("deps")?;
         opts.resource = self.or("resource", None)?;
         opts.cacheable = self.or("cacheable", true)?;
@@ -681,6 +696,8 @@ impl Spec<'_> {
             }),
         );
         n.max_retries = self.or("max_retries", n.max_retries)?;
+        n.retry_policy = self.retry_policy()?;
+        n.protected_paths = self.protected_paths()?;
         n.deps = self.strings("deps")?;
         n.resource = self.or("resource", None)?;
         let dirty = self.or(
@@ -1107,7 +1124,8 @@ impl BuildScope {
     }
 
     fn runtime_key(&self, name: &str) -> bool {
-        self.published_keys.contains(name)
+        matches!(name, "__kgraph_run_status" | "__kgraph_failure")
+            || self.published_keys.contains(name)
             || self.published_keys.iter().any(|key| TEMPLATE.is_match(key))
     }
 
@@ -1249,13 +1267,65 @@ impl PreparedReduction<'_> {
 }
 
 impl Spec<'_> {
-    fn task(&self, id: &str) -> Result<TaskNode, String> {
-        match self.value["type"].as_str() {
-            Some("agent") => self.agent(id),
-            Some("gate") => self.gate(id),
-            Some("shell") => self.shell(id),
-            _ => Err("Expected task node".into()),
+    fn retry_policy(&self) -> Result<RetryPolicy, String> {
+        let backoff_s: Option<f64> = self.or("retry_backoff_s", None)?;
+        if let Some(b) = backoff_s {
+            if !b.is_finite() || b < 0.0 {
+                return Err("retry_backoff_s must be a non-negative finite number".into());
+            }
         }
+        let max_backoff_s: Option<f64> = self.or("retry_max_backoff_s", None)?;
+        if let Some(m) = max_backoff_s {
+            if !m.is_finite() || m <= 0.0 {
+                return Err("retry_max_backoff_s must be a positive finite number".into());
+            }
+        }
+        let transient_error_regex: Option<String> = self.or("transient_error_regex", None)?;
+        if let Some(ref re) = transient_error_regex {
+            Regex::new(re).map_err(|e| format!("Invalid transient_error_regex: {e}"))?;
+        }
+        Ok(RetryPolicy {
+            backoff_s,
+            max_backoff_s,
+            jitter: self.or("retry_jitter", true)?,
+            transient_retries: self.or("transient_retries", 0)?,
+            transient_error_regex,
+            oscillation_breaker: self.or("oscillation_breaker", true)?,
+        })
+    }
+
+    fn protected_paths(&self) -> Result<Option<ProtectedPaths>, String> {
+        let mut paths: Vec<PathBuf> = self
+            .strings("immutable_paths")?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        paths.extend(self.strings("protect_paths")?.into_iter().map(PathBuf::from));
+        let mut globs = self.strings("protect_globs")?;
+        globs.extend(self.strings("immutable_globs")?);
+        if paths.is_empty() && globs.is_empty() {
+            return Ok(None);
+        }
+        let base_dir = self
+            .optional_path("cwd")?
+            .unwrap_or_else(|| self.base.into());
+        Ok(Some(ProtectedPaths {
+            base_dir,
+            paths,
+            globs,
+        }))
+    }
+
+    fn task(&self, id: &str) -> Result<TaskNode, String> {
+        let mut node = match self.value["type"].as_str() {
+            Some("agent") => self.agent(id)?,
+            Some("gate") => self.gate(id)?,
+            Some("shell") => self.shell(id)?,
+            _ => return Err("Expected task node".into()),
+        };
+        node.retry_policy = self.retry_policy()?;
+        node.protected_paths = self.protected_paths()?;
+        Ok(node)
     }
 }
 
@@ -1619,7 +1689,18 @@ fn build_node(
             &scope,
         )
     };
-    match s.get::<String>("type")?.as_str() {
+    let when_expr: Option<String> = s.or("when", None)?;
+    if let Some(ref expr) = when_expr {
+        parse_when_expr(expr)?;
+    }
+    let when_scope = scope.clone();
+    let when_item = item.cloned();
+    let when_fn: Option<WhenFn> = when_expr.clone().map(|expr| {
+        Arc::new(move |ctx: &Context| {
+            eval_when_expr(&expr, &when_scope.context(ctx), when_item.as_ref(), &when_scope)
+        }) as WhenFn
+    });
+    let mut node = match s.get::<String>("type")?.as_str() {
         "shell" | "agent" | "gate" => {
             let task = s.task(&id)?;
             let isolation = Isolation::parse(&s)?;
@@ -1633,23 +1714,24 @@ fn build_node(
                 && late_fields.is_empty()
                 && !(rendered["type"] == "agent" && rendered.get("prompt_file").is_some())
             {
-                return Ok(Node::Task(task));
+                Node::Task(task)
+            } else {
+                Node::Task(
+                    TaskInvocation {
+                        scope,
+                        pending_repair: Default::default(),
+                        fields: rendered,
+                        base: base.into(),
+                        item: item.cloned(),
+                        id,
+                        late_fields,
+                        isolation,
+                        export,
+                        reduction,
+                    }
+                    .wrap(task),
+                )
             }
-            Ok(Node::Task(
-                TaskInvocation {
-                    scope,
-                    pending_repair: Default::default(),
-                    fields: rendered,
-                    base: base.into(),
-                    item: item.cloned(),
-                    id,
-                    late_fields,
-                    isolation,
-                    export,
-                    reduction,
-                }
-                .wrap(task),
-            ))
         }
         "subgraph" => {
             if spec["type"] != "subgraph" {
@@ -1672,9 +1754,9 @@ fn build_node(
             n.qa_checklist_path = graph_qa_checklist(&n.nodes);
             n.deps = s.strings("deps")?;
             n.resource = s.or("resource", None)?;
-            Ok(Node::Subgraph(n))
+            Node::Subgraph(n)
         }
-        "loop_subgraph" => s.review_loop(&id, build()?),
+        "loop_subgraph" => s.review_loop(&id, build()?)?,
         "splitter" => {
             let items = s.or::<Option<Vec<Value>>>("items", None)?;
             let key = s.or::<Option<String>>("items_from_ctx", None)?;
@@ -1722,10 +1804,31 @@ fn build_node(
             }
             n.deps = s.strings("deps")?;
             n.resource = s.or("resource", None)?;
-            Ok(Node::Splitter(n))
+            Node::Splitter(n)
         }
-        kind => Err(format!("{id}: unknown node type {kind:?}")),
+        kind => return Err(format!("{id}: unknown node type {kind:?}")),
+    };
+    if let Some(when_fn) = when_fn {
+        match &mut node {
+            Node::Task(n) => {
+                n.when_fn = Some(when_fn);
+                n.when_expr = when_expr;
+            }
+            Node::Subgraph(n) => {
+                n.when_fn = Some(when_fn);
+                n.when_expr = when_expr;
+            }
+            Node::LoopSubgraph(n) => {
+                n.when_fn = Some(when_fn);
+                n.when_expr = when_expr;
+            }
+            Node::Splitter(n) => {
+                n.when_fn = Some(when_fn);
+                n.when_expr = when_expr;
+            }
+        }
     }
+    Ok(node)
 }
 fn inherit_worktree(child: &mut Value, parent: &Value) -> Result<(), String> {
     match child["type"].as_str() {
@@ -2125,10 +2228,19 @@ pub fn load_declarative_workflow(
     }
     let context = Context::from_map(values);
     let explicit = fields.remove("nodes");
+    let finally_raw = fields.remove("finally");
     let preset = fields.remove("preset");
     // Inspect command sources before rendering erases the boundary between code and data.
     if let Some(nodes) = explicit.as_ref().and_then(Value::as_array) {
         for node in nodes {
+            validate_node_commands(node)?;
+        }
+    }
+    if let Some(raw_finally) = finally_raw.as_ref() {
+        let arr = raw_finally
+            .as_array()
+            .ok_or("finally must be an array of nodes")?;
+        for node in arr {
             validate_node_commands(node)?;
         }
     }
@@ -2140,6 +2252,17 @@ pub fn load_declarative_workflow(
         base: &base,
         value: &rendered,
     };
+    let budgets: WorkflowBudgets = spec.or("budgets", WorkflowBudgets::default())?;
+    if let Some(c) = budgets.max_cost_usd {
+        if !c.is_finite() || c <= 0.0 {
+            return Err("budgets.max_cost_usd must be a positive finite number".into());
+        }
+    }
+    if let Some(w) = budgets.max_wall_time_s {
+        if !w.is_finite() || w <= 0.0 {
+            return Err("budgets.max_wall_time_s must be a positive finite number".into());
+        }
+    }
     let nodes = match (explicit, preset) {
         (Some(raw), None) => build_nodes(
             &raw,
@@ -2151,14 +2274,433 @@ pub fn load_declarative_workflow(
         (None, Some(Value::String(name))) => preset_document(&name, &base, &rendered)?,
         _ => return Err("Specify either a nodes array or a named preset".into()),
     };
+    let finally_nodes = match finally_raw {
+        Some(raw) => build_nodes(
+            &raw,
+            &base,
+            &context,
+            None,
+            &BuildScope::workflow(&raw, &base, path)?,
+        )?,
+        None => Vec::new(),
+    };
     let qa_checklist_path = spec
         .optional_path("qa_checklist_path")?
         .or_else(|| graph_qa_checklist(&nodes));
     Ok(LoadedWorkflow {
         title: spec.or("title", None)?,
         nodes,
+        finally_nodes,
+        budgets,
         context,
         qa_checklist_path,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Safe deterministic `when` expression parser and evaluator
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum WhenExpr {
+    Or(Box<WhenExpr>, Box<WhenExpr>),
+    And(Box<WhenExpr>, Box<WhenExpr>),
+    Not(Box<WhenExpr>),
+    Eq(WhenOperand, WhenOperand),
+    Ne(WhenOperand, WhenOperand),
+    In(WhenOperand, WhenOperand),
+    Truthy(WhenOperand),
+}
+
+#[derive(Debug, Clone)]
+enum WhenOperand {
+    Path(String),
+    Literal(Value),
+    List(Vec<Value>),
+}
+
+fn split_top_level<'a>(input: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = input.as_bytes();
+    let op_bytes = op.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i + op_bytes.len() <= bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => quote = Some(b),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && &bytes[i..i + op_bytes.len()] == op_bytes => {
+                // Ensure word operators like ` in ` are bounded by whitespace.
+                if op == " in " {
+                    return Some((&input[..i], &input[i + op_bytes.len()..]));
+                }
+                return Some((&input[..i], &input[i + op_bytes.len()..]));
+            }
+            _ => (),
+        }
+        i += 1;
+    }
+    None
+}
+
+fn strip_outer_parens(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+        let bytes = trimmed.as_bytes();
+        let mut depth = 0usize;
+        let mut quote: Option<u8> = None;
+        let mut encloses_all = true;
+        for (idx, &b) in bytes.iter().enumerate() {
+            if let Some(q) = quote {
+                if b == q && bytes.get(idx.wrapping_sub(1)) != Some(&b'\\') {
+                    quote = None;
+                }
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && idx + 1 < bytes.len() {
+                        encloses_all = false;
+                        break;
+                    }
+                }
+                _ => (),
+            }
+        }
+        if encloses_all && depth == 0 {
+            s = &trimmed[1..trimmed.len() - 1];
+        } else {
+            return trimmed;
+        }
+    }
+}
+
+fn parse_when_literal(raw: &str) -> Result<Value, String> {
+    let t = raw.trim();
+    if (t.starts_with('\'') && t.ends_with('\'')) || (t.starts_with('"') && t.ends_with('"')) {
+        if t.len() < 2 {
+            return Err(format!("Unterminated string literal in when expression: {raw}"));
+        }
+        return Ok(Value::String(
+            t[1..t.len() - 1]
+                .replace("\\'", "'")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\"),
+        ));
+    }
+    match t {
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
+        "null" => Ok(Value::Null),
+        _ => {
+            if let Ok(i) = t.parse::<i64>() {
+                Ok(json!(i))
+            } else if let Ok(f) = t.parse::<f64>() {
+                Ok(json!(f))
+            } else {
+                Err(format!("Invalid literal in when expression: {raw}"))
+            }
+        }
+    }
+}
+
+fn parse_when_operand(raw: &str) -> Result<WhenOperand, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err("Empty operand in when expression".into());
+    }
+    if t.starts_with('[') && t.ends_with(']') {
+        let inner = t[1..t.len() - 1].trim();
+        if inner.is_empty() {
+            return Ok(WhenOperand::List(Vec::new()));
+        }
+        let mut items = Vec::new();
+        for part in inner.split(',') {
+            items.push(parse_when_literal(part)?);
+        }
+        return Ok(WhenOperand::List(items));
+    }
+    if t.starts_with("ctx.")
+        || t == "item"
+        || t.starts_with("item.")
+        || t.starts_with("outputs.")
+    {
+        return Ok(WhenOperand::Path(t.to_owned()));
+    }
+    Ok(WhenOperand::Literal(parse_when_literal(t)?))
+}
+
+fn parse_when_expr(raw: &str) -> Result<WhenExpr, String> {
+    let t = strip_outer_parens(raw);
+    if t.is_empty() {
+        return Err("when expression cannot be empty".into());
+    }
+    if let Some((l, r)) = split_top_level(t, "||") {
+        return Ok(WhenExpr::Or(
+            Box::new(parse_when_expr(l)?),
+            Box::new(parse_when_expr(r)?),
+        ));
+    }
+    if let Some((l, r)) = split_top_level(t, "&&") {
+        return Ok(WhenExpr::And(
+            Box::new(parse_when_expr(l)?),
+            Box::new(parse_when_expr(r)?),
+        ));
+    }
+    if let Some(rest) = t.strip_prefix('!') {
+        return Ok(WhenExpr::Not(Box::new(parse_when_expr(rest)?)));
+    }
+    if let Some((l, r)) = split_top_level(t, "==") {
+        return Ok(WhenExpr::Eq(parse_when_operand(l)?, parse_when_operand(r)?));
+    }
+    if let Some((l, r)) = split_top_level(t, "!=") {
+        return Ok(WhenExpr::Ne(parse_when_operand(l)?, parse_when_operand(r)?));
+    }
+    if let Some((l, r)) = split_top_level(t, " in ") {
+        return Ok(WhenExpr::In(parse_when_operand(l)?, parse_when_operand(r)?));
+    }
+    Ok(WhenExpr::Truthy(parse_when_operand(t)?))
+}
+
+fn lookup_dotted(mut cur: &Value, rest: &str) -> Value {
+    for seg in rest.split('.') {
+        match cur {
+            Value::Object(map) => match map.get(seg) {
+                Some(v) => cur = v,
+                None => return Value::Null,
+            },
+            Value::Array(arr) => match seg.parse::<usize>().ok().and_then(|i| arr.get(i)) {
+                Some(v) => cur = v,
+                None => return Value::Null,
+            },
+            _ => return Value::Null,
+        }
+    }
+    cur.clone()
+}
+
+fn resolve_when_operand(
+    op: &WhenOperand,
+    ctx: &Context,
+    item: Option<&Value>,
+    scope: &BuildScope,
+) -> Result<Value, String> {
+    match op {
+        WhenOperand::Literal(v) => Ok(v.clone()),
+        WhenOperand::List(list) => Ok(Value::Array(list.clone())),
+        WhenOperand::Path(path) => {
+            if let Some(rest) = path.strip_prefix("ctx.") {
+                let mut parts = rest.splitn(2, '.');
+                let head = parts.next().unwrap_or("");
+                if let Some(val) = ctx.get(head) {
+                    return Ok(match parts.next() {
+                        Some(tail) => lookup_dotted(&val, tail),
+                        None => val,
+                    });
+                }
+                if scope.runtime_key(head) {
+                    return Err(format!("upstream context key '{head}' not yet produced"));
+                }
+                Ok(Value::Null)
+            } else if let Some(rest) = path.strip_prefix("outputs.") {
+                // Support both ctx.outputs.<node> and top-level exported ctx.<node>.
+                if let Some(outputs_val) = ctx.get("outputs") {
+                    let found = lookup_dotted(&outputs_val, rest);
+                    if !found.is_null() {
+                        return Ok(found);
+                    }
+                }
+                let mut parts = rest.splitn(2, '.');
+                let head = parts.next().unwrap_or("");
+                if let Some(val) = ctx.get(head) {
+                    return Ok(match parts.next() {
+                        Some(tail) => lookup_dotted(&val, tail),
+                        None => val,
+                    });
+                }
+                if scope.runtime_key(head) {
+                    return Err(format!("upstream output '{head}' not yet produced"));
+                }
+                Ok(Value::Null)
+            } else if path == "item" {
+                Ok(item.cloned().unwrap_or(Value::Null))
+            } else if let Some(rest) = path.strip_prefix("item.") {
+                Ok(item.map_or(Value::Null, |v| lookup_dotted(v, rest)))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+    }
+}
+
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(m) => !m.is_empty(),
+    }
+}
+
+fn eval_when_ast(
+    expr: &WhenExpr,
+    ctx: &Context,
+    item: Option<&Value>,
+    scope: &BuildScope,
+) -> Result<bool, String> {
+    match expr {
+        WhenExpr::Or(l, r) => Ok(eval_when_ast(l, ctx, item, scope)? || eval_when_ast(r, ctx, item, scope)?),
+        WhenExpr::And(l, r) => Ok(eval_when_ast(l, ctx, item, scope)? && eval_when_ast(r, ctx, item, scope)?),
+        WhenExpr::Not(inner) => Ok(!eval_when_ast(inner, ctx, item, scope)?),
+        WhenExpr::Truthy(op) => Ok(is_truthy(&resolve_when_operand(op, ctx, item, scope)?)),
+        WhenExpr::Eq(l, r) => Ok(resolve_when_operand(l, ctx, item, scope)?
+            == resolve_when_operand(r, ctx, item, scope)?),
+        WhenExpr::Ne(l, r) => Ok(resolve_when_operand(l, ctx, item, scope)?
+            != resolve_when_operand(r, ctx, item, scope)?),
+        WhenExpr::In(needle, haystack) => {
+            let n = resolve_when_operand(needle, ctx, item, scope)?;
+            let h = resolve_when_operand(haystack, ctx, item, scope)?;
+            Ok(match h {
+                Value::Array(arr) => arr.contains(&n),
+                Value::String(s) => n.as_str().is_some_and(|sub| s.contains(sub)),
+                Value::Object(map) => n.as_str().is_some_and(|k| map.contains_key(k)),
+                _ => false,
+            })
+        }
+    }
+}
+
+fn eval_when_expr(
+    raw: &str,
+    ctx: &Context,
+    item: Option<&Value>,
+    scope: &BuildScope,
+) -> Result<bool, String> {
+    let ast = parse_when_expr(raw)?;
+    eval_when_ast(&ast, ctx, item, scope)
+}
+
+/// Return a Draft 2020-12 JSON Schema describing declarative TOML/JSON KGraph workflows.
+pub fn workflow_json_schema() -> Value {
+    let mut node_props = Map::new();
+    for (k, v) in [
+        ("id", json!({ "type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_-]*$" })),
+        ("type", json!({ "type": "string", "enum": ["shell", "agent", "gate", "subgraph", "loop_subgraph", "splitter"] })),
+        ("deps", json!({ "type": "array", "items": { "type": "string" } })),
+        ("resource", json!({ "type": "string" })),
+        ("when", json!({ "type": "string", "description": "Safe boolean expression over ctx.*, outputs.*, and item.* (supports !, ==, !=, in, &&, ||)." })),
+        ("cacheable", json!({ "type": "boolean", "default": true })),
+        ("cwd", json!({ "type": "string" })),
+        ("env", json!({ "type": "object", "additionalProperties": { "type": "string" } })),
+        ("command", json!({ "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] })),
+        ("outputs", json!({ "type": "array", "items": { "type": "string" } })),
+        ("watch_paths", json!({ "type": "array", "items": { "type": "string" } })),
+        ("watch_globs", json!({ "type": "array", "items": { "type": "string" } })),
+        ("log_path", json!({ "type": "string" })),
+        ("expect_stdout_regex", json!({ "type": "string" })),
+        ("timeout_s", json!({ "type": "number", "exclusiveMinimum": 0 })),
+        ("max_retries", json!({ "type": "integer", "minimum": 0 })),
+        ("retry_backoff_s", json!({ "type": "number", "minimum": 0, "description": "Initial exponential backoff delay in seconds before retrying." })),
+        ("retry_max_backoff_s", json!({ "type": "number", "exclusiveMinimum": 0, "description": "Maximum backoff cap in seconds (default 60)." })),
+        ("retry_jitter", json!({ "type": "boolean", "default": true })),
+        ("transient_retries", json!({ "type": "integer", "minimum": 0, "default": 0, "description": "Extra retries for transient 429/529/timeout failures without consuming max_retries." })),
+        ("transient_error_regex", json!({ "type": "string", "description": "Optional custom regex matching transient errors." })),
+        ("oscillation_breaker", json!({ "type": "boolean", "default": true, "description": "Trip circuit breaker on ping-pong oscillation cycles (e.g. A -> B -> A)." })),
+        ("immutable_paths", json!({ "type": "array", "items": { "type": "string" }, "description": "Files/directories that must remain unmodified during node/loop execution." })),
+        ("protect_globs", json!({ "type": "array", "items": { "type": "string" }, "description": "Relative globs whose SHA-256 fingerprint must remain unchanged (anti-reward-hijacking)." })),
+        ("max_feedback_bytes", json!({ "type": "integer", "minimum": 1, "description": "Byte budget for compacted retry feedback injected into agent prompts." })),
+        ("adapter", json!({ "type": "object" })),
+        ("prompt", json!({ "type": "string" })),
+        ("prompt_file", json!({ "type": "string" })),
+        ("evaluator", json!({ "type": "object" })),
+        ("isolation", json!({ "type": "string", "enum": ["worktree"] })),
+        ("worktree", json!({ "type": "object" })),
+        ("export_json", json!({ "type": "object" })),
+        ("output_schema", json!({ "type": "object" })),
+        ("verify_cmd", json!({ "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] })),
+        ("verify_json", json!({ "type": "object" })),
+        ("verify_json_path", json!({ "type": "string" })),
+        ("dirty_nodes", json!({ "type": "array", "items": { "type": "string" } })),
+        ("packet_path", json!({ "type": "string" })),
+        ("packet", json!({ "type": "object" })),
+        ("artifact_paths", json!({ "type": "array", "items": { "type": "string" } })),
+        ("from", json!({ "type": "string", "description": "Relative path or @lib/<name> reusable subgraph reference." })),
+        ("with", json!({ "type": "object" })),
+        ("preset", json!({ "type": "string" })),
+        ("config", json!({ "type": "object" })),
+        ("nodes", json!({ "type": "array", "items": { "$ref": "#/$defs/node" } })),
+        ("items", json!({ "type": "array" })),
+        ("items_from_ctx", json!({ "type": "string" })),
+        ("max_workers", json!({ "type": "integer", "minimum": 1 })),
+        ("template", json!({ "$ref": "#/$defs/node" })),
+        ("reduce", json!({ "type": "object" })),
+    ] {
+        node_props.insert(k.into(), v);
+    }
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://github.com/dawsv/kgraph-runner/schema/workflow.v0.4.json",
+        "title": "KGraph Runner Declarative Workflow",
+        "type": "object",
+        "properties": {
+            "title": { "type": "string", "description": "Human-readable workflow title shown in Hero Town and reports." },
+            "default_context": { "type": "object", "description": "Default key/value context available as {{ctx.key}} and in when expressions." },
+            "qa_checklist_path": { "type": "string", "description": "Optional path to a manual QA checklist JSON file." },
+            "budgets": {
+                "type": "object",
+                "description": "Hard run-level budget guardrails enforced before node dispatches and retries.",
+                "properties": {
+                    "max_worker_calls": { "type": "integer", "minimum": 1 },
+                    "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 },
+                    "max_tokens": { "type": "integer", "minimum": 1 },
+                    "max_wall_time_s": { "type": "number", "exclusiveMinimum": 0 }
+                },
+                "additionalProperties": false
+            },
+            "nodes": {
+                "type": "array",
+                "description": "Top-level DAG nodes executed in dependency order.",
+                "items": { "$ref": "#/$defs/node" }
+            },
+            "finally": {
+                "type": "array",
+                "description": "Cleanup or escalation nodes executed unconditionally after the main graph completes (receives ctx.__kgraph_run_status and ctx.__kgraph_failure).",
+                "items": { "$ref": "#/$defs/node" }
+            },
+            "preset": {
+                "type": "string",
+                "enum": ["desktop_bug_fix", "bug_batch", "game_regression", "version_history", "histoury_bug_fix"]
+            },
+            "config": { "type": "object" }
+        },
+        "$defs": {
+            "node": {
+                "type": "object",
+                "required": ["id", "type"],
+                "properties": Value::Object(node_props)
+            }
+        }
     })
 }
 #[cfg(test)]
@@ -3218,6 +3760,89 @@ max_retries = 1
             json!({"nodes":[{"type":"loop_subgraph","id":"verify","nodes":[]}]}),
         ] {
             assert!(json_workflow(dir.path(), doc).is_err())
+        }
+    }
+
+    #[test]
+    fn declarative_when_finally_budgets_protected_paths_and_schema() {
+        let dir = TempDir::new().unwrap();
+        let protected = dir.path().join("guard.txt");
+        fs::write(&protected, "original").unwrap();
+
+        // 1. `when` expressions + `finally` on failure + `[budgets]` parsing
+        let wf = json_workflow(
+            dir.path(),
+            json!({
+                "title": "v0.4.0 declarative",
+                "default_context": {
+                    "env": "staging",
+                    "areas": ["api", "ui"],
+                    "run_slow": false
+                },
+                "budgets": {
+                    "max_cost_usd": 2.5,
+                    "max_tokens": 50000,
+                    "max_wall_time_s": 120.0
+                },
+                "nodes": [
+                    {
+                        "id": "skipped_slow",
+                        "type": "shell",
+                        "when": "ctx.run_slow && 'api' in ctx.areas",
+                        "command": ["python3", "-c", "open('should_not_exist','w').write('x')"]
+                    },
+                    {
+                        "id": "runs_api",
+                        "type": "shell",
+                        "deps": ["skipped_slow"],
+                        "when": "ctx.env != 'prod' && 'api' in ctx.areas",
+                        "command": ["python3", "-c", "open('ran_api.txt','w').write('ok')"],
+                        "outputs": ["ran_api.txt"]
+                    },
+                    {
+                        "id": "tamper",
+                        "type": "shell",
+                        "deps": ["runs_api"],
+                        "immutable_paths": ["guard.txt"],
+                        "command": ["python3", "-c", "open('guard.txt','w').write('tampered')"]
+                    }
+                ],
+                "finally": [
+                    {
+                        "id": "on_fail_note",
+                        "type": "shell",
+                        "when": "ctx.__kgraph_run_status != 'passed'",
+                        "command": ["python3", "-c", "import os; open('finally_ran.txt','w').write(os.environ['STATUS'])"],
+                        "env": { "STATUS": "{{ctx.__kgraph_run_status}}" }
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        assert_eq!(wf.budgets.max_cost_usd, Some(2.5));
+        assert_eq!(wf.budgets.max_tokens, Some(50000));
+        assert_eq!(wf.budgets.max_wall_time_s, Some(120.0));
+        assert_eq!(wf.finally_nodes.len(), 1);
+
+        let mut cfg = RunnerConfig::new(dir.path().join("state.json"));
+        cfg.logger = Some(Arc::new(|_| {}));
+        cfg.finally_nodes = wf.finally_nodes;
+        let r = GraphRunner::new(cfg).unwrap();
+        let err = r.run(&wf.nodes, &wf.context, "").unwrap_err();
+        assert_eq!(err.node_path, "tamper");
+        assert!(err.reason.contains("Protected files were modified"), "{}", err.reason);
+        assert!(!dir.path().join("should_not_exist").exists());
+        assert_eq!(fs::read_to_string(dir.path().join("ran_api.txt")).unwrap(), "ok");
+        assert_eq!(fs::read_to_string(dir.path().join("finally_ran.txt")).unwrap(), "failed");
+
+        // 2. JSON schema exposes v0.4.0 fields cleanly
+        let schema = workflow_json_schema();
+        assert_eq!(schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
+        assert!(schema["properties"]["budgets"].is_object());
+        assert!(schema["properties"]["finally"].is_object());
+        let node_props = &schema["$defs"]["node"]["properties"];
+        for key in ["when", "retry_backoff_s", "transient_retries", "oscillation_breaker", "immutable_paths", "max_feedback_bytes"] {
+            assert!(node_props.get(key).is_some(), "schema missing {key}");
         }
     }
 }

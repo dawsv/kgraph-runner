@@ -50,8 +50,52 @@ static CREDENTIAL: Lazy<Regex> = Lazy::new(|| {
 )).expect("credential regex")
 });
 
+static ERROR_LINE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:error\[|\berror:|failed|panic|traceback|assertion|exception|rejected)")
+        .expect("error line regex")
+});
+
 pub fn redact_secrets(text: &str) -> String {
     CREDENTIAL.replace_all(text, "[redacted]").into_owned()
+}
+
+/// Compact retry feedback to fit `max_bytes` while preserving high-signal error lines
+/// and the trailing context (mitigates context rot on multi-attempt loops).
+pub fn compact_feedback(text: &str, max_bytes: usize) -> String {
+    let clean = redact_secrets(text);
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if clean.len() <= max_bytes {
+        return clean;
+    }
+    let marker = "\n...[compacted for retry context budget]...\n";
+    if max_bytes <= marker.len() + 32 {
+        return prefix(&clean, max_bytes).to_owned();
+    }
+    let budget = max_bytes - marker.len();
+    let head_budget = (budget * 35) / 100;
+    let mut head = String::new();
+    for line in clean.lines() {
+        if ERROR_LINE.is_match(line) {
+            let needed = line.len() + usize::from(!head.is_empty());
+            if head.len() + needed <= head_budget {
+                if !head.is_empty() {
+                    head.push('\n');
+                }
+                head.push_str(line);
+            }
+        }
+    }
+    if head.is_empty() {
+        head.push_str(prefix(&clean, head_budget));
+    }
+    let tail_budget = budget.saturating_sub(head.len());
+    let mut start = clean.len().saturating_sub(tail_budget);
+    while start < clean.len() && !clean.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{head}{marker}{}", &clean[start..])
 }
 
 fn prefix(text: &str, limit: usize) -> &str {
@@ -481,5 +525,19 @@ mod tests {
             assert!(prompt.contains(snippet), "{prompt}");
         }
         assert_eq!(prompt.matches("missing score").count(), 1);
+    }
+
+    #[test]
+    fn compact_feedback_preserves_error_lines_and_tail_within_budget() {
+        let mut text = String::from("error[E0308]: mismatched types\n");
+        for i in 0..200 {
+            text.push_str(&format!("verbose build line {i} with padding padding padding\n"));
+        }
+        text.push_str("FINAL_TAIL_MARKER: bearer supersecret123\n");
+        let compacted = compact_feedback(&text, 400);
+        assert!(compacted.len() <= 400, "len={}", compacted.len());
+        assert!(compacted.contains("error[E0308]: mismatched types"), "{compacted}");
+        assert!(compacted.contains("FINAL_TAIL_MARKER"), "{compacted}");
+        assert!(!compacted.contains("supersecret123"), "{compacted}");
     }
 }

@@ -67,6 +67,19 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Check KGraph binaries, toolchain, shared @lib subgraphs, and MCP setup.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prune orphaned .kgraph Git worktrees and stale lock/runtime files.
+    Clean(Clean),
+    /// Emit the JSON Schema (Draft 2020-12) for declarative TOML/JSON workflows.
+    Schema {
+        /// Optional path to write the schema file instead of printing to stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Record manual QA and review quality metrics.
     Qa {
         #[command(subcommand)]
@@ -199,6 +212,24 @@ pub struct Run {
     pub max_parallel: isize,
     #[arg(long, allow_negative_numbers = true)]
     pub max_workers: Option<isize>,
+    /// Cumulative USD cost ceiling across all agent calls in this run.
+    #[arg(long)]
+    pub max_cost_usd: Option<f64>,
+    /// Cumulative token ceiling across all agent calls in this run.
+    #[arg(long)]
+    pub max_tokens: Option<u64>,
+    /// Wall-clock duration ceiling in seconds for this run.
+    #[arg(long)]
+    pub max_wall_time: Option<f64>,
+    /// Optional webhook URL notified when a run pauses on a gate, fails, or completes.
+    #[arg(long, env = "KGRAPH_NOTIFY_WEBHOOK")]
+    pub notify_webhook: Option<String>,
+    /// Optional shared secret for signing webhook payloads with X-KGraph-Signature (HMAC-SHA256).
+    #[arg(long, env = "KGRAPH_NOTIFY_SECRET", hide_env_values = true)]
+    pub notify_secret: Option<String>,
+    /// Send a native OS desktop notification when the run pauses or finishes.
+    #[arg(long)]
+    pub notify_desktop: bool,
     #[arg(long, env = "KGRAPH_HUB_URL")]
     pub hub_url: Option<String>,
     #[arg(long, env = "KGRAPH_HUB_TOKEN", hide_env_values = true)]
@@ -465,6 +496,21 @@ pub struct Claim {
     #[arg(long)]
     pub worktree: Option<PathBuf>,
 }
+#[derive(Args)]
+pub struct Clean {
+    /// Workspace directory containing .kgraph/.
+    #[arg(long, default_value = ".")]
+    pub dir: PathBuf,
+    /// Preview items that would be removed without deleting anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Also remove persisted state, report, and log files under .kgraph/.
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
 #[derive(Args)]
 pub struct Lease {
     pub state: PathBuf,

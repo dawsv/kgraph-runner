@@ -258,11 +258,26 @@ fn once(
     } else {
         load(&paths.workflow, &args.execution.definition).map(Arc::new)
     };
-    let max_workers = args.max_workers.and_then(|n| usize::try_from(n).ok());
+    let max_workers = args
+        .max_workers
+        .and_then(|n| usize::try_from(n).ok())
+        .or_else(|| loaded.as_ref().ok().and_then(|f| f.budgets.max_worker_calls));
     let outputs = Arc::new(Mutex::new(Outputs::new()));
     let mut config = config(&args.execution);
     config.max_parallel_nodes = usize::try_from(args.max_parallel).unwrap_or(1);
     config.max_worker_calls = max_workers.map(|n| n.saturating_sub(previous));
+    config.max_cost_usd = args
+        .max_cost_usd
+        .or_else(|| loaded.as_ref().ok().and_then(|f| f.budgets.max_cost_usd));
+    config.max_tokens = args
+        .max_tokens
+        .or_else(|| loaded.as_ref().ok().and_then(|f| f.budgets.max_tokens));
+    config.max_wall_time_s = args
+        .max_wall_time
+        .or_else(|| loaded.as_ref().ok().and_then(|f| f.budgets.max_wall_time_s));
+    if let Ok(flow) = &loaded {
+        config.finally_nodes = flow.finally_nodes.clone();
+    }
     if args.quiet {
         config.logger = Some(Arc::new(|_| {}));
     }
@@ -355,6 +370,20 @@ fn once(
     paths.register(status, expected);
     record_telemetry(dirty_probe);
     let id = hub.and_then(|h| h.finish(paths.snapshot(flow, status, None)));
+    if args.notify_webhook.is_some() || args.notify_desktop {
+        crate::notify::send(
+            &crate::notify::NotifyConfig {
+                webhook_url: args.notify_webhook.as_deref(),
+                webhook_secret: args.notify_secret.as_deref(),
+                desktop: args.notify_desktop,
+            },
+            status,
+            &paths.workflow,
+            &paths.report,
+            &result.error,
+            &result.packets,
+        );
+    }
     if !args.quiet {
         println!("{status} | report: {}", paths.report.display());
         if result.code == 4 && result.packets.len() > 1 {

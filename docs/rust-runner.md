@@ -293,13 +293,26 @@ kgraph run review.toml
 
 Hero Town exposes waiting packets and active leases at `GET /api/workboard`. In Hub mode the corresponding routes for a locally accessible run are `GET /api/runs/<id>/workboard` and `GET /api/runs/<id>/telemetry`.
 
-**MCP for a /goal client.** Configure the client's stdio server command as `kgraph` with argument `mcp` and set its working directory to the project root. The server speaks newline-delimited JSON-RPC. `tools/list` returns the argument schemas for all 13 tools.
+**MCP for a /goal client.** Configure the client's stdio server command as `kgraph` with argument `mcp` and set its working directory to the project root. The server speaks newline-delimited JSON-RPC. `tools/list` returns the argument schemas for all 15 tools, and `resources/list` / `resources/read` expose `kgraph://schema`, `kgraph://subgraphs`, and `kgraph://templates`.
 
 | Use | MCP tool names |
 | --- | --- |
 | Plan, execute, and inspect | `kgraph_plan`, `kgraph_run`, `kgraph_status`, `kgraph_report`, `kgraph_analyze` |
 | Coordinate workers | `kgraph_workboard`, `kgraph_claim`, `kgraph_heartbeat`, `kgraph_release`, `kgraph_complete` |
 | Report progress and resolve decisions | `kgraph_progress`, `kgraph_ask`, `kgraph_answer` |
+| Diagnostics and workspace hygiene | `kgraph_doctor`, `kgraph_clean` |
+
+## Loop engineering and graph controls (v0.4.0)
+
+Declarative TOML/JSON workflows support guardrails designed specifically for reliable agentic loops:
+
+- **Hard run budgets (`[budgets]` or CLI `--max-cost-usd`, `--max-tokens`, `--max-wall-time`, `--max-workers`):** Enforced before every node dispatch and retry attempt. Exceeding a cap exits cleanly with code 3 (`budget_exceeded`).
+- **Oscillation & stagnation circuit breakers:** In addition to consecutive `A -> A` failures, loops automatically detect ping-pong cycles (`A -> B -> A`) and trip the circuit breaker (exit code 2). Set `oscillation_breaker = false` on a node or loop to opt out.
+- **Transient backoff retries:** Set `transient_retries`, `retry_backoff_s`, `retry_max_backoff_s`, `retry_jitter`, and optional `transient_error_regex` so upstream rate limits (`429`/`529`) and timeouts back off exponentially without consuming `max_retries` or tripping the logic circuit breaker.
+- **Conditional execution (`when`) and guaranteed cleanup (`finally`):** Any node accepts a safe deterministic `when` expression over `ctx.*`, `outputs.*`, and `item.*` (`!`, `==`, `!=`, `in`, `&&`, `||`). Top-level `finally = [...]` nodes always run after the main graph completes, receiving `ctx.__kgraph_run_status` and `ctx.__kgraph_failure`.
+- **Anti-reward-hijacking (`immutable_paths` / `protect_globs`):** Snapshot SHA-256 fingerprints of protected test or config files before running an agent or loop; if modified or deleted, verification fails with `error_signature = "protected_path_modified"`.
+- **Compacted retry feedback (`max_feedback_bytes`):** Bounds repair context and evaluator critiques injected into retry prompts while preserving key error lines and trailing context.
+- **Workspace hygiene, schema & pings:** Use `kgraph doctor` to verify setup, `kgraph clean [--dry-run] [--all]` to prune orphaned worktrees and stale locks, `kgraph schema` to emit Draft 2020-12 JSON Schema, and `kgraph run --notify-webhook URL [--notify-secret S] [--notify-desktop]` for gate/completion alerts.
 
 For example, a goal client can call `kgraph_run`, inspect the workboard when the run pauses, and claim a packet using the same state path. This is the claim request on the wire.
 
