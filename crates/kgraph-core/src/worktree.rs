@@ -50,9 +50,23 @@ pub struct WorktreeResult {
     pub merged: bool,
 }
 
+// Git for Windows rejects verbatim `\\?\C:\...` prefixes from `Path::canonicalize()`.
+fn git_arg(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(s) = path.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            let b = rest.as_bytes();
+            if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_owned()
+}
+
 fn git(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.current_dir(dir)
+    cmd.current_dir(git_arg(dir))
         .stdin(Stdio::null())
         .env_remove("GIT_DIR")
         .env_remove("GIT_COMMON_DIR")
@@ -241,6 +255,7 @@ impl IsolatedWorktree {
             run(git(&root).args(["check-ref-format", &format!("refs/heads/{b}")]))?;
         }
         let mut add = git(&root);
+        let worktree_arg = git_arg(&path);
         add.args(["worktree", "add"]);
         if let Some(b) = &branch {
             // Named branches are retained so exported commits remain reachable.
@@ -249,12 +264,14 @@ impl IsolatedWorktree {
                 if tip != base_commit {
                     return Err(format!("existing branch {b} differs from requested base"));
                 }
-                add.arg("--").arg(&path).arg(b);
+                add.arg("--").arg(&worktree_arg).arg(b);
             } else {
-                add.args(["-b", b, "--"]).arg(&path).arg(&base_commit);
+                add.args(["-b", b, "--"]).arg(&worktree_arg).arg(&base_commit);
             }
         } else {
-            add.args(["--detach", "--"]).arg(&path).arg(&base_commit);
+            add.args(["--detach", "--"])
+                .arg(&worktree_arg)
+                .arg(&base_commit);
         }
         let listing = run(git(&root).args(["worktree", "list", "--porcelain", "-z"]))?;
         let registered = listing
@@ -268,7 +285,7 @@ impl IsolatedWorktree {
             require_owner(&root, &path, &common, &spec.node_path)?;
             run(git(&root)
                 .args(["worktree", "remove", "--force"])
-                .arg(&path))?;
+                .arg(&worktree_arg))?;
         } else if path.try_exists().map_err(|e| e.to_string())? {
             return Err(format!(
                 "path is not an owned Git worktree: {}",
@@ -463,7 +480,7 @@ impl IsolatedWorktree {
         )?;
         run(git(&self.spec.repo_root)
             .args(["worktree", "remove", "--force"])
-            .arg(&self.path))?;
+            .arg(git_arg(&self.path)))?;
         self.cleanup = false;
         Ok(())
     }
