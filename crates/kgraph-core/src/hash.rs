@@ -1,18 +1,19 @@
 //! Deterministic input hashes compatible with the Python workflow runner.
 
-use globset::{GlobBuilder, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::{DirEntry, WalkDir};
 
 pub const DEFAULT_IGNORE_DIRS: &[&str] = &[
     ".git",
@@ -33,7 +34,7 @@ pub fn default_ignore_dirs() -> HashSet<String> {
     DEFAULT_IGNORE_DIRS.iter().map(|s| (*s).into()).collect()
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FileIdentity {
     dev: u64,
     ino: u64,
@@ -42,13 +43,23 @@ struct FileIdentity {
     ctime_ns: i128,
 }
 
-type CacheKey = (PathBuf, FileIdentity);
 type DigestBytes = [u8; 32];
-static FILE_CACHE: Lazy<Mutex<HashMap<CacheKey, DigestBytes>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+type CacheShard = RwLock<HashMap<FileIdentity, DigestBytes>>;
+static FILE_CACHE: Lazy<[CacheShard; 64]> =
+    Lazy::new(|| std::array::from_fn(|_| RwLock::default()));
+
+thread_local! {
+    static READ_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0; 64 * 1024]);
+}
+
+fn cache_shard(stat: &FileIdentity) -> &CacheShard {
+    &FILE_CACHE[(stat.ino as usize) & 63]
+}
 
 pub fn clear_hash_cache() {
-    FILE_CACHE.lock().unwrap().clear();
+    for shard in FILE_CACHE.iter() {
+        shard.write().unwrap().clear();
+    }
 }
 
 fn unix_ns(time: SystemTime) -> i128 {
@@ -76,39 +87,65 @@ fn file_identity(_: &Metadata) -> Option<FileIdentity> {
     None
 }
 
-fn file_digest(path: &Path, use_cache: bool) -> io::Result<DigestBytes> {
-    let mut key = None;
-    if use_cache {
-        let stat = file_identity(&fs::metadata(path)?)
-            .filter(|s| unix_ns(SystemTime::now()) - s.mtime_ns >= 2_000_000_000);
-        if let Some(stat) = stat {
-            let candidate = (path.canonicalize()?, stat);
-            if let Some(&digest) = FILE_CACHE.lock().unwrap().get(&candidate) {
-                return Ok(digest);
-            }
-            key = Some(candidate);
-        }
-    }
+#[derive(Clone, Copy)]
+enum CacheMode {
+    Disabled,
+    Cold(i128),
+    Warm(i128),
+}
 
-    let mut file = File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            break;
+fn cache_key(meta: &Metadata, now_ns: i128) -> Option<FileIdentity> {
+    file_identity(meta).filter(|s| now_ns - s.mtime_ns >= 2_000_000_000)
+}
+
+fn file_digest(
+    path: &Path,
+    mode: CacheMode,
+    metadata: Option<&Metadata>,
+) -> io::Result<DigestBytes> {
+    let (mut file, key) = match mode {
+        CacheMode::Disabled => (File::open(path)?, None),
+        CacheMode::Cold(now_ns) => {
+            // With no cached values to probe, open once and stat the descriptor.
+            let file = File::open(path)?;
+            let key = match metadata {
+                Some(meta) => cache_key(meta, now_ns),
+                None => cache_key(&file.metadata()?, now_ns),
+            };
+            (file, key)
         }
-        hash.update(&buffer[..count]);
-    }
+        CacheMode::Warm(now_ns) => {
+            let key = match metadata {
+                Some(meta) => cache_key(meta, now_ns),
+                None => cache_key(&fs::metadata(path)?, now_ns),
+            };
+            if let Some(stat) = key {
+                if let Some(&digest) = cache_shard(&stat).read().unwrap().get(&stat) {
+                    return Ok(digest);
+                }
+            }
+            (File::open(path)?, key)
+        }
+    };
+    let mut hash = Sha256::new();
+    READ_BUF.with_borrow_mut(|buffer| -> io::Result<()> {
+        loop {
+            let count = file.read(buffer)?;
+            if count == 0 {
+                return Ok(());
+            }
+            hash.update(&buffer[..count]);
+        }
+    })?;
     let digest = hash.finalize().into();
-    if let Some(key) = key {
+    if let Some(stat) = key {
         // Compare the open descriptor, even if a rename replaced the pathname.
-        if file_identity(&file.metadata()?).as_ref() == Some(&key.1) {
-            let mut cache = FILE_CACHE.lock().unwrap();
-            if cache.len() >= 16_384 {
+        if file_identity(&file.metadata()?) == Some(stat) {
+            let mut cache = cache_shard(&stat).write().unwrap();
+            if cache.len() >= 512 {
                 cache.clear();
             }
-            cache.insert(key, digest);
+            cache.insert(stat, digest);
         }
     }
     Ok(digest)
@@ -119,7 +156,7 @@ pub fn sha256_bytes(data: &[u8]) -> String {
 }
 
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    file_digest(path, false)
+    file_digest(path, CacheMode::Disabled, None)
         .map(hex::encode)
         .map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -233,11 +270,14 @@ fn absolute_root(root: Option<&Path>) -> Result<PathBuf, String> {
     Ok(normalize(&cwd.join(root)))
 }
 
-fn relative_path(path: &Path, root: &Path) -> PathBuf {
+fn relative_path<'a>(path: &'a Path, root: &Path) -> Cow<'a, Path> {
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Cow::Borrowed(relative);
+    }
     let mut base = root.components().peekable();
     let mut target = path.components().peekable();
     if base.peek() != target.peek() {
-        return path.to_owned();
+        return Cow::Borrowed(path);
     }
     while base.peek().is_some() && base.peek() == target.peek() {
         base.next();
@@ -245,14 +285,17 @@ fn relative_path(path: &Path, root: &Path) -> PathBuf {
     }
     let mut relative: PathBuf = base.map(|_| "..").collect();
     relative.extend(target);
-    relative
+    Cow::Owned(relative)
 }
 
-fn posix_bytes(path: &Path) -> Vec<u8> {
+fn posix_bytes(path: Cow<'_, Path>) -> Vec<u8> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        match path {
+            Cow::Borrowed(path) => path.as_os_str().as_bytes().to_vec(),
+            Cow::Owned(path) => path.into_os_string().into_vec(),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -281,13 +324,152 @@ fn filename_codepoints(mut name: &[u8]) -> Vec<u32> {
     key
 }
 
-fn walk_entry(entry: &DirEntry, ignore: &HashSet<String>) -> bool {
-    entry.depth() == 0
-        || !entry.file_type().is_dir()
-        || !entry
-            .file_name()
-            .to_str()
-            .is_some_and(|name| ignore.contains(name))
+struct InputFile {
+    name: Vec<u8>,
+    path: PathBuf,
+    // Only explicit paths and symlinks already needed metadata to identify files.
+    metadata: Option<Box<Metadata>>,
+}
+
+struct Walker<'a> {
+    root: &'a Path,
+    ignore: &'a HashSet<String>,
+    excluded: HashSet<PathBuf>,
+    files: Mutex<Vec<InputFile>>,
+}
+
+struct GlobFilter {
+    matcher: GlobSet,
+    directories_only: Vec<bool>,
+    max_depth: usize,
+}
+
+impl<'a> Walker<'a> {
+    fn new(root: &'a Path, ignore: &'a HashSet<String>, excluded: &[PathBuf]) -> Self {
+        Self {
+            root,
+            ignore,
+            excluded: excluded.iter().map(|p| normalize(&root.join(p))).collect(),
+            files: Mutex::default(),
+        }
+    }
+
+    fn ignored(&self, path: &Path) -> bool {
+        relative_path(path, self.root)
+            .iter()
+            .any(|part| part.to_str().is_some_and(|s| self.ignore.contains(s)))
+    }
+
+    fn input(&self, path: PathBuf) {
+        if path.parent().is_some_and(|parent| self.ignored(parent)) {
+            return;
+        }
+        let Ok(link) = fs::symlink_metadata(&path) else {
+            return;
+        };
+        if link.is_dir() {
+            if !self.ignored(&path) {
+                self.walk(&path, None);
+            }
+        } else {
+            let meta = if link.is_symlink() {
+                fs::metadata(&path).ok()
+            } else {
+                Some(link)
+            };
+            if let Some(file) = meta.filter(|m| m.is_file()) {
+                if !self.excluded.contains(&path) {
+                    self.files.lock().unwrap().push(InputFile {
+                        name: posix_bytes(relative_path(&path, self.root)),
+                        path,
+                        metadata: Some(Box::new(file)),
+                    });
+                }
+            }
+        }
+    }
+
+    fn walk(&self, base: &Path, filter: Option<&GlobFilter>) {
+        rayon::scope(|scope| self.directory(scope, base, base, filter, 1));
+    }
+
+    fn directory<'s>(
+        &'s self,
+        scope: &rayon::Scope<'s>,
+        dir: &Path,
+        base: &'s Path,
+        filter: Option<&'s GlobFilter>,
+        depth: usize,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        // A parent glob can start above root. Apply custom ignored components
+        // (including "..") to the matched input relative to the original root.
+        let base_is_root = base == self.root;
+        let ignored_parent = filter.is_some() && !base_is_root && self.ignored(dir);
+        let mut batch = Vec::new();
+        let mut matches = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|s| self.ignore.contains(s))
+            {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(base).expect("walk stays under base");
+            let selected = filter.is_none_or(|glob| {
+                glob.matcher.matches_into(relative, &mut matches);
+                matches
+                    .iter()
+                    .any(|&i| kind.is_dir() || !glob.directories_only[i])
+            });
+            if selected && ignored_parent {
+                continue;
+            }
+            if kind.is_dir() {
+                if selected || filter.is_some_and(|glob| depth < glob.max_depth) {
+                    let next_filter = if selected { None } else { filter };
+                    scope.spawn(move |scope| {
+                        self.directory(scope, &path, base, next_filter, depth + 1)
+                    });
+                }
+            } else if selected && !self.excluded.contains(&path) {
+                let metadata = if kind.is_file() {
+                    None
+                } else if kind.is_symlink() {
+                    let Ok(meta) = fs::metadata(&path) else {
+                        continue;
+                    };
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    Some(Box::new(meta))
+                } else {
+                    continue;
+                };
+                let name = if base_is_root {
+                    Cow::Borrowed(relative)
+                } else {
+                    relative_path(&path, self.root)
+                };
+                batch.push(InputFile {
+                    name: posix_bytes(name),
+                    path,
+                    metadata,
+                });
+            }
+        }
+        if !batch.is_empty() {
+            self.files.lock().unwrap().append(&mut batch);
+        }
+    }
 }
 
 pub fn hash_paths<P: AsRef<Path>>(
@@ -299,65 +481,48 @@ pub fn hash_paths<P: AsRef<Path>>(
 ) -> Result<String, String> {
     let root = absolute_root(root)?;
     let defaults = default_ignore_dirs();
-    let ignore = ignore_dirs.unwrap_or(&defaults);
-    let excluded: HashSet<_> = exclude_paths
-        .iter()
-        .map(|p| normalize(&root.join(p)))
-        .collect();
-    let mut files = HashSet::new();
+    let walker = Walker::new(&root, ignore_dirs.unwrap_or(&defaults), exclude_paths);
     for input in paths {
-        let path = normalize(&root.join(input));
-        if path.parent().is_some_and(|parent| {
-            relative_path(parent, &root)
-                .iter()
-                .any(|part| part.to_str().is_some_and(|s| ignore.contains(s)))
-        }) {
-            continue;
-        }
-        if path.is_file() {
-            files.insert(path);
-        } else if path.is_dir() && !path.is_symlink() {
-            if path != root
-                && path
-                    .file_name()
-                    .and_then(|p| p.to_str())
-                    .is_some_and(|s| ignore.contains(s))
-            {
-                continue;
-            }
-            for entry in WalkDir::new(path)
-                .into_iter()
-                .filter_entry(|e| walk_entry(e, ignore))
-                .flatten()
-            {
-                if entry.file_type().is_file()
-                    || (entry.file_type().is_symlink() && entry.path().is_file())
-                {
-                    files.insert(entry.into_path());
-                }
-            }
-        }
+        walker.input(normalize(&root.join(input)));
     }
+    hash_files(walker.files.into_inner().unwrap(), use_cache)
+}
 
-    let mut sorted: Vec<_> = files
-        .difference(&excluded)
-        .map(|p| (posix_bytes(&relative_path(p, &root)), p))
-        .collect();
-    if sorted
-        .iter()
-        .all(|(name, _)| std::str::from_utf8(name).is_ok())
-    {
-        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+fn hash_files(mut sorted: Vec<InputFile>, use_cache: bool) -> Result<String, String> {
+    if sorted.iter().all(|f| std::str::from_utf8(&f.name).is_ok()) {
+        sorted.sort_unstable_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     } else {
-        sorted.sort_by_cached_key(|(name, _)| filename_codepoints(name));
+        sorted.sort_by_cached_key(|f| filename_codepoints(&f.name));
     }
-    let digests: Result<Vec<_>, _> = sorted
-        .par_iter()
-        .map(|(_, p)| file_digest(p, use_cache).map_err(|e| format!("{}: {e}", p.display())))
+    sorted.dedup_by(|a, b| a.path == b.path);
+    let mode = if use_cache {
+        let now_ns = unix_ns(SystemTime::now());
+        if sorted.len() >= FILE_CACHE.len()
+            && FILE_CACHE
+                .iter()
+                .all(|shard| shard.read().unwrap().is_empty())
+        {
+            CacheMode::Cold(now_ns)
+        } else {
+            CacheMode::Warm(now_ns)
+        }
+    } else {
+        CacheMode::Disabled
+    };
+    let reads = sorted.par_iter();
+    // Excess concurrent opens contend inside the macOS filesystem. Four
+    // batches retain parallel SHA-256 while bounding active file readers.
+    #[cfg(target_os = "macos")]
+    let reads = reads.with_min_len((sorted.len() / 4).max(1));
+    let digests: Result<Vec<_>, _> = reads
+        .map(|f| {
+            file_digest(&f.path, mode, f.metadata.as_deref())
+                .map_err(|e| format!("{}: {e}", f.path.display()))
+        })
         .collect();
     let mut hash = Sha256::new();
-    for ((name, _), digest) in sorted.into_iter().zip(digests?) {
-        hash.update(name);
+    for (file, digest) in sorted.into_iter().zip(digests?) {
+        hash.update(file.name);
         hash.update(b"\0");
         hash.update(digest);
     }
@@ -375,7 +540,7 @@ pub fn hash_globs(
     let defaults = default_ignore_dirs();
     let ignore = ignore_dirs.unwrap_or(&defaults);
     // Group by walk base so ordinary globs stay within root, even in a
-    // request which also watches siblings. hash_paths still keys every match
+    // request which also watches siblings. The walker keys every match
     // relative to the original root.
     let mut groups: HashMap<PathBuf, Vec<(String, bool)>> = HashMap::new();
     for pattern in patterns {
@@ -401,31 +566,24 @@ pub fn hash_globs(
             .or_default()
             .push((normalized, directory_only));
     }
-    let mut matches = Vec::new();
+    let walker = Walker::new(&root, ignore, exclude_paths);
     for (base, group) in groups {
-        collect_glob_matches(&base, group, ignore, &mut matches)?;
+        collect_glob_matches(&base, group, &walker)?;
     }
-    hash_paths(
-        &matches,
-        Some(&root),
-        Some(ignore),
-        exclude_paths,
-        use_cache,
-    )
+    hash_files(walker.files.into_inner().unwrap(), use_cache)
 }
 
 fn collect_glob_matches(
     base: &Path,
     patterns: Vec<(String, bool)>,
-    ignore: &HashSet<String>,
-    matches: &mut Vec<PathBuf>,
+    walker: &Walker<'_>,
 ) -> Result<(), String> {
     let mut builder = GlobSetBuilder::new();
     let mut directories_only = Vec::new();
     let mut max_depth = 0;
     for (normalized, directory_only) in patterns {
         if normalized.is_empty() || normalized == "**" {
-            matches.push(base.to_owned());
+            walker.input(base.to_owned());
             return Ok(());
         }
         let normalized = normalized.strip_suffix("/**").unwrap_or(&normalized);
@@ -450,35 +608,12 @@ fn collect_glob_matches(
         );
         directories_only.push(directory_only);
     }
-    let matcher = builder.build().map_err(|e| e.to_string())?;
-    // Once a directory matches, hash_paths walks it, so prune overlapping matches here.
-    let mut walk = WalkDir::new(base).max_depth(max_depth).into_iter();
-    while let Some(entry) = walk.next() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if entry.depth() == 0 {
-            continue;
-        }
-        if !walk_entry(&entry, ignore) {
-            walk.skip_current_dir();
-            continue;
-        }
-        let relative = entry
-            .path()
-            .strip_prefix(base)
-            .expect("walk stays under its base");
-        if matcher
-            .matches(relative)
-            .iter()
-            .any(|&i| !directories_only[i] || entry.file_type().is_dir())
-        {
-            if entry.file_type().is_dir() {
-                walk.skip_current_dir();
-            }
-            matches.push(entry.into_path());
-        }
-    }
+    let filter = GlobFilter {
+        matcher: builder.build().map_err(|e| e.to_string())?,
+        directories_only,
+        max_depth,
+    };
+    walker.walk(base, Some(&filter));
     Ok(())
 }
 
@@ -586,6 +721,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parent_globs_deduplicate_against_local_matches_and_apply_parent_ignores() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("workspace");
+        write(&root, "dir/keep.bin", b"local");
+        write(&root, "dir/skip.bin", b"excluded");
+        write(tmp.path(), "other/outside.bin", b"outside");
+        let patterns = ["dir/", "../**/*.bin", "**/*.bin"].map(String::from);
+        let excluded = [PathBuf::from("dir/skip.bin")];
+        for (ignore, files) in [
+            (HashSet::new(), vec!["dir/keep.bin", "../other/outside.bin"]),
+            (HashSet::from(["..".to_owned()]), vec!["dir/keep.bin"]),
+        ] {
+            assert_eq!(
+                hash_globs(&patterns, Some(&root), Some(&ignore), &excluded, true).unwrap(),
+                hash_paths(&files, Some(&root), Some(&ignore), &[], false).unwrap()
+            );
+        }
+    }
+
     #[cfg(not(unix))]
     #[test]
     fn replacement_with_same_size_and_mtime_is_rehashed() {
@@ -601,7 +756,9 @@ mod tests {
                 .set_modified(old)
                 .unwrap();
             assert_eq!(
-                hex::encode(file_digest(&path, true).unwrap()),
+                hex::encode(
+                    file_digest(&path, CacheMode::Warm(unix_ns(SystemTime::now())), None).unwrap()
+                ),
                 sha256_bytes(contents)
             );
             fs::remove_file(&path).unwrap();
@@ -651,35 +808,36 @@ mod tests {
         let old = SystemTime::now() - Duration::from_secs(10);
         let handle = File::options().write(true).open(&file).unwrap();
         handle.set_modified(old).unwrap();
-        let key = || {
-            (
-                file.canonicalize().unwrap(),
-                file_identity(&file.metadata().unwrap()).unwrap(),
-            )
-        };
-        assert_eq!(file_digest(&file, true).unwrap(), original);
+        let cached =
+            || file_digest(&file, CacheMode::Warm(unix_ns(SystemTime::now())), None).unwrap();
+        let key = || file_identity(&file.metadata().unwrap()).unwrap();
+        assert_eq!(cached(), original);
         // A sentinel distinguishes an actual cache hit from an identical recomputation.
         assert_eq!(
-            FILE_CACHE.lock().unwrap().insert(key(), [42; 32]),
+            cache_shard(&key()).write().unwrap().insert(key(), [42; 32]),
             Some(original)
         );
-        assert_eq!(file_digest(&file, true).unwrap(), [42; 32]);
-        assert_eq!(file_digest(&file, false).unwrap(), original);
+        assert_eq!(cached(), [42; 32]);
+        assert_eq!(
+            file_digest(&file, CacheMode::Disabled, None).unwrap(),
+            original
+        );
 
         handle.set_modified(SystemTime::now()).unwrap();
-        assert_eq!(file_digest(&file, true).unwrap(), original);
-        assert!(FILE_CACHE.lock().unwrap().insert(key(), [99; 32]).is_none());
-        assert_eq!(file_digest(&file, true).unwrap(), original);
+        assert_eq!(cached(), original);
+        assert!(cache_shard(&key())
+            .write()
+            .unwrap()
+            .insert(key(), [99; 32])
+            .is_none());
+        assert_eq!(cached(), original);
         fs::write(&file, b"other").unwrap();
         handle.set_modified(old + Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            hex::encode(file_digest(&file, true).unwrap()),
-            sha256_bytes(b"other")
-        );
+        assert_eq!(hex::encode(cached()), sha256_bytes(b"other"));
         clear_hash_cache();
         assert_eq!(
-            file_digest(&file, true).unwrap(),
-            file_digest(&file, false).unwrap()
+            cached(),
+            file_digest(&file, CacheMode::Disabled, None).unwrap()
         );
     }
 

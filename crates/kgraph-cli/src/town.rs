@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-fn provider(mut town: Town, command: &str) -> Result<snapshot::SnapshotProvider> {
+fn provider(mut town: Town, command: &str) -> Result<snapshot::CachedSnapshotProvider> {
     if let Some(w) = &town.workflow {
         town.state
             .get_or_insert_with(|| default_file(w, "_state.json"));
@@ -24,17 +24,15 @@ fn provider(mut town: Town, command: &str) -> Result<snapshot::SnapshotProvider>
         ));
     }
     if town.workflow.as_deref().is_some_and(is_python) {
-        return Ok(Arc::new(move || {
-            Ok(snapshot::build_town_snapshot_from_graph(
-                town.workflow.as_deref(),
-                town.state.as_deref(),
-                town.report.as_deref(),
-                None,
-                town.title.as_deref(),
-                None,
-                None,
-            ))
-        }));
+        return Ok(snapshot::CachedSnapshotProvider::new(
+            town.workflow,
+            town.state,
+            town.report,
+            None,
+            town.title,
+            None,
+        )
+        .recorded_only());
     }
     let loader: Option<snapshot::DefinitionLoader> = if town.definition.ctx.is_some() {
         town.workflow.clone().map(|path| {
@@ -56,7 +54,7 @@ fn provider(mut town: Town, command: &str) -> Result<snapshot::SnapshotProvider>
     } else {
         None
     };
-    Ok(snapshot::cached_town_snapshot(
+    Ok(snapshot::CachedSnapshotProvider::new(
         town.workflow,
         town.state,
         town.report,
@@ -87,8 +85,8 @@ fn config(s: &Serve, layout: &str, read_only: bool) -> server::ServerConfig {
 
 pub fn ui(town: Town, s: Serve, layout: &str, read_only: bool) -> Result<i32> {
     let provider = provider(town, "ui")?;
-    provider()?;
-    server::serve_town_blocking(
+    provider.value()?;
+    server::serve_cached_town_blocking(
         provider,
         config(&s, layout, read_only),
         s.open,
@@ -134,7 +132,22 @@ pub fn render(town: Town, layout: &str, output: Option<PathBuf>, embed: bool) ->
             .unwrap_or_else(|| ".kgraph/town.html".into())
     });
     let ctx = town.definition.ctx_file.clone();
-    let data = provider(town, "render")?()?;
+    let data = if town.workflow.is_none() {
+        if town.state.is_none() {
+            return Err("kgraph-town render requires a workflow or --state".into());
+        }
+        Arc::new(snapshot::build_town_snapshot_from_graph(
+            None,
+            town.state.as_deref(),
+            town.report.as_deref(),
+            None,
+            town.title.as_deref(),
+            None,
+            None,
+        ))
+    } else {
+        provider(town, "render")?.value()?
+    };
     let target = resolve(&output)?;
     for path in ["workflow_ref", "state_file", "report_file"]
         .iter()
@@ -191,7 +204,11 @@ fn pushed(r: &Value) {
     println!("Pushed {} | {}", sval(r, "id"), sval(r, "status"));
 }
 pub fn push(town: Town, url: &str, opts: &Publish) -> Result<i32> {
-    pushed(&publish(provider(town, "push")?()?, url, opts)?);
+    pushed(&publish(
+        Arc::unwrap_or_clone(provider(town, "push")?.value()?),
+        url,
+        opts,
+    )?);
     Ok(0)
 }
 
@@ -276,16 +293,19 @@ fn finish_update(update: Update, data: Value) -> Result<i32> {
             .ok()
             .and_then(|root| root.parent().map(Path::to_owned))
             .unwrap_or(cwd);
-        let mut snapshot = provider(
-            Town {
-                workflow,
-                state: Some(state),
-                report: Some(report),
-                definition: Default::default(),
-                title: None,
-            },
-            "push",
-        )?()?;
+        let mut snapshot = Arc::unwrap_or_clone(
+            provider(
+                Town {
+                    workflow,
+                    state: Some(state),
+                    report: Some(report),
+                    definition: Default::default(),
+                    title: None,
+                },
+                "push",
+            )?
+            .value()?,
+        );
         snapshot["project_dir"] = json!(project);
         let env = std::env::var("KGRAPH_HUB_URL").ok();
         let url = default_url(

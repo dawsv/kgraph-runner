@@ -4,7 +4,7 @@ use crate::network::{
     discover_access_urls, generate_token, with_token, AccessUrl, CloudflareTunnel,
 };
 pub use crate::snapshot::SnapshotProvider;
-use crate::snapshot::{build_town_snapshot_from_graph, disable_responses};
+use crate::snapshot::{build_town_snapshot_from_graph, disable_responses, CachedSnapshotProvider};
 use crate::ui::{self, RenderTownOptions};
 use crate::{registry, workboard};
 use axum::body::{to_bytes, Body, Bytes};
@@ -68,8 +68,22 @@ impl RunningTownServer {
     }
 }
 
+enum SingleWorkflow {
+    Custom(SnapshotProvider),
+    Cached(Box<CachedSnapshotProvider>),
+}
+
+impl SingleWorkflow {
+    fn snapshot(&self) -> Result<Value, String> {
+        match self {
+            Self::Custom(provider) => provider(),
+            Self::Cached(provider) => Ok((*provider.value()?).clone()),
+        }
+    }
+}
+
 enum Source {
-    Town(SnapshotProvider),
+    Town(SingleWorkflow),
     Hub(Vec<PathBuf>),
 }
 
@@ -91,13 +105,13 @@ impl Town {
     }
     fn runs(&self) -> Result<Vec<Value>, String> {
         match &self.source {
-            Source::Town(provider) => Ok(vec![registry::single_run_entry(&provider()?)]),
+            Source::Town(provider) => Ok(vec![registry::single_run_entry(&provider.snapshot()?)]),
             Source::Hub(dirs) => Ok(registry::list_runs(dirs)),
         }
     }
     fn snapshot(&self, selected: &str) -> Result<(Value, Option<Value>), String> {
         let (snapshot, active) = match &self.source {
-            Source::Town(provider) => (provider()?, None),
+            Source::Town(provider) => (provider.snapshot()?, None),
             Source::Hub(dirs) => {
                 let mut runs = registry::list_runs(dirs);
                 let index = runs.iter().position(|r| r["id"] == selected).unwrap_or(0);
@@ -121,7 +135,7 @@ impl Town {
         match &self.source {
             Source::Hub(dirs) => Ok(id.and_then(|id| registry::get_run(id, dirs))),
             Source::Town(provider) => {
-                let snapshot = provider()?;
+                let snapshot = provider.snapshot()?;
                 Ok(Some(
                     if require_state && snapshot["state_file"].as_str().unwrap_or("").is_empty() {
                         json!({})
@@ -550,6 +564,13 @@ async fn dispatch(town: Arc<Town>, req: Request) -> Response {
     if op == Endpoint::Events {
         return events(town, field(&query, "run").unwrap_or("").into()).await;
     }
+    if op == Endpoint::Snapshot {
+        if let Source::Town(SingleWorkflow::Cached(provider)) = &town.source {
+            if let Some(bytes) = provider.warm_bytes(!town.enabled()) {
+                return reply(StatusCode::OK, JSON, bytes);
+            }
+        }
+    }
     let payload = if mutation && op != Endpoint::Delete {
         let (limit, msg) = match op {
             Endpoint::Ingest => (2 * 1024 * 1024, "Snapshot payload exceeds 2 MiB"),
@@ -600,6 +621,15 @@ fn execute(
     let not_found = || error(StatusCode::NOT_FOUND, "Run not found");
     Ok(match op {
         Endpoint::Home | Endpoint::Snapshot => {
+            if op == Endpoint::Snapshot {
+                if let Source::Town(SingleWorkflow::Cached(provider)) = &town.source {
+                    return Ok(reply(
+                        StatusCode::OK,
+                        JSON,
+                        provider.json_bytes(!town.enabled())?,
+                    ));
+                }
+            }
             let (snap, active) = town.snapshot(selected)?;
             let active_id = active.as_ref().and_then(|r| r["id"].as_str());
             if op == Endpoint::Snapshot {
@@ -915,7 +945,7 @@ async fn events(town: Arc<Town>, selected: String) -> Response {
 // response encoding. One request per connection matches the Python server.
 async fn read_head(socket: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     const LIMIT: usize = 64 * 1024;
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(1024);
     let mut buf = [0; 4096];
     while bytes.len() < LIMIT {
         let n = socket.read(&mut buf).await?;
@@ -1042,6 +1072,7 @@ async fn serve_connections(
             Some(_)=clients.join_next(), if !clients.is_empty()=>{},
             accepted=listener.accept()=>{
                 let (socket,_)=accepted.map_err(|e|e.to_string())?;
+                let _ = socket.set_nodelay(true);
                 clients.spawn(connection(socket,app.clone(),shutdown.clone()));
             }
         }
@@ -1114,9 +1145,14 @@ pub async fn start_town_server(
     snapshot_fn: SnapshotProvider,
     config: ServerConfig,
 ) -> Result<RunningTownServer, String> {
-    Ok(start(Source::Town(snapshot_fn), config, false, KEEPALIVE)
-        .await?
-        .0)
+    Ok(start(
+        Source::Town(SingleWorkflow::Custom(snapshot_fn)),
+        config,
+        false,
+        KEEPALIVE,
+    )
+    .await?
+    .0)
 }
 pub async fn start_hub_server(
     watch_dirs: Vec<PathBuf>,
@@ -1196,7 +1232,22 @@ pub fn serve_town_blocking(
     no_auth: bool,
 ) -> Result<(), String> {
     serve_blocking(
-        Source::Town(snapshot_fn),
+        Source::Town(SingleWorkflow::Custom(snapshot_fn)),
+        config,
+        open_browser,
+        tunnel,
+        no_auth,
+    )
+}
+pub fn serve_cached_town_blocking(
+    provider: CachedSnapshotProvider,
+    config: ServerConfig,
+    open_browser: bool,
+    tunnel: bool,
+    no_auth: bool,
+) -> Result<(), String> {
+    serve_blocking(
+        Source::Town(SingleWorkflow::Cached(Box::new(provider))),
         config,
         open_browser,
         tunnel,
@@ -1687,7 +1738,7 @@ mod tests {
             Ok(json!({"revision":changed.load(Ordering::SeqCst),"generated_at":i,"nested":nested}))
         });
         let (s, _) = start(
-            Source::Town(provider),
+            Source::Town(SingleWorkflow::Custom(provider)),
             config(Some("secret"), false),
             false,
             Duration::from_millis(90),

@@ -24,10 +24,12 @@ use std::{
 type Result<T> = std::result::Result<T, String>;
 
 pub fn run_cli() -> i32 {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init();
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     run_cli_from(std::env::args_os())
 }
 
@@ -173,8 +175,13 @@ fn project_dir() -> Result<PathBuf> {
 fn print_json(value: &impl Serialize) -> Result<i32> {
     use std::fmt::Write;
     let raw = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    let Some(first_escape) = raw.bytes().position(|b| b >= 127) else {
+        println!("{raw}");
+        return Ok(0);
+    };
     let mut escaped = String::with_capacity(raw.len());
-    for c in raw.chars() {
+    escaped.push_str(&raw[..first_escape]);
+    for c in raw[first_escape..].chars() {
         if c < '\x7f' {
             escaped.push(c);
         } else {

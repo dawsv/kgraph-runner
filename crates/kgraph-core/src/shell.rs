@@ -95,16 +95,7 @@ impl CommandProcess {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: the post-fork hook only calls setsid and reads errno on failure.
-            unsafe {
-                command.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        Err(io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
+            command.process_group(0);
         }
         let child = command
             .stdout(Stdio::piped())
@@ -116,7 +107,7 @@ impl CommandProcess {
     fn terminate(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            // SAFETY: setsid made the child's PID the ID of its dedicated group.
+            // SAFETY: process_group(0) makes the child's PID its dedicated group ID.
             if unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGKILL) } == -1 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -207,7 +198,7 @@ struct Capture {
 
 impl Capture {
     fn finish(&mut self, returncode: i32) -> io::Result<CommandOutput> {
-        // A descendant outside the session may still hold a pipe open. Detached
+        // A descendant outside the group may still hold a pipe open. Detached
         // readers must never append to the final log after the drain deadline.
         self.closed = true;
         if let Some(log) = &mut self.log {
@@ -262,6 +253,50 @@ fn spawn_reader(
                 return Ok(());
             }
         }
+    })
+}
+
+fn decode_all(bytes: Vec<u8>) -> String {
+    let text = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    if !text.contains('\r') {
+        return text;
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some((line, tail)) = rest.split_once('\r') {
+        normalized.push_str(line);
+        normalized.push('\n');
+        rest = tail.strip_prefix('\n').unwrap_or(tail);
+    }
+    normalized.push_str(rest);
+    normalized
+}
+
+fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn capture_output(process: &mut CommandProcess) -> Result<CommandOutput, TaskRunError> {
+    // Drain both pipes concurrently while retaining the process-group guard on every error.
+    let stderr = process.child.stderr.take().expect("piped stderr");
+    let reader = thread::Builder::new()
+        .spawn(move || read_pipe(stderr))
+        .map_err(command_io)?;
+    let stdout =
+        read_pipe(process.child.stdout.take().expect("piped stdout")).map_err(command_io)?;
+    let stderr = reader
+        .join()
+        .map_err(|_| TaskRunError::other("Command reader panicked"))?
+        .map_err(command_io)?;
+    let status = process.child.wait().map_err(command_io)?;
+    process.armed = false;
+    Ok(CommandOutput {
+        returncode: returncode(status),
+        stdout: decode_all(stdout),
+        stderr: decode_all(stderr),
     })
 }
 
@@ -321,6 +356,9 @@ pub fn run_command_streaming(
         fs::create_dir_all(parent).map_err(command_io)?;
     }
     let mut process = CommandProcess::spawn(command).map_err(command_io)?;
+    if timeout.is_none() && log_path.is_none() {
+        return capture_output(&mut process);
+    }
     let log = log_path.map(File::create).transpose().map_err(command_io)?;
     let capture = Arc::new(Mutex::new(Capture {
         log,
@@ -334,7 +372,8 @@ pub fn run_command_streaming(
         spawn_reader(stderr, capture.clone(), true).map_err(command_io)?,
     ];
 
-    let poll_interval = Duration::from_millis(10);
+    let mut poll_delays = [200, 500, 1000, 2000, 5000].into_iter();
+    let max_interval = Duration::from_millis(10);
     let status = loop {
         // Surface reader failures even while a producer is still running.
         let mut i = 0;
@@ -354,6 +393,10 @@ pub fn run_command_streaming(
                 break Some(status);
             }
         }
+        let poll_interval = poll_delays
+            .next()
+            .map(Duration::from_micros)
+            .unwrap_or(max_interval);
         let delay = timeout
             .map(|limit| limit.saturating_sub(start.elapsed()))
             .unwrap_or(poll_interval);
@@ -363,7 +406,7 @@ pub fn run_command_streaming(
             while readers.iter().any(|r| !r.is_finished())
                 && drain_start.elapsed() < Duration::from_secs(1)
             {
-                thread::sleep(poll_interval);
+                thread::sleep(max_interval);
             }
             for reader in readers {
                 if reader.is_finished() {
@@ -451,6 +494,13 @@ mod tests {
 
     fn options(cmd: impl Into<ShellCommand>) -> ShellTaskOptions {
         ShellTaskOptions::new("check", cmd, Arc::new(|_| Ok("input".into())))
+    }
+
+    #[test]
+    fn whole_output_matches_streaming_decoding() {
+        let input = b"first\r\nsecond\rthird\xe2\x82\xac\xff\xf0\x9f";
+        let expected = StreamDecoder::default().decode(input, true);
+        assert_eq!(decode_all(input.to_vec()), expected);
     }
 
     #[test]

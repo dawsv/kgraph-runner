@@ -403,7 +403,7 @@ pub fn append_run_telemetry(path: &Path, run: &RunTelemetry) -> Result<(), Strin
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let old_len =
         prepare_append(&mut file, &mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Err(e) = file.write_all(&bytes).and_then(|()| file.sync_data()) {
+    if let Err(e) = file.write_all(&bytes).and_then(|()| files::sync_file(&file)) {
         file.set_len(old_len)
             .map_err(|rollback| format!("{}: {e}; rollback: {rollback}", path.display()))?;
         return Err(format!("{}: {e}", path.display()));

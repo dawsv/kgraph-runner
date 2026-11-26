@@ -5,14 +5,16 @@ use crate::{
     },
     redaction::{has_credentials, redact_credentials},
 };
+use axum::body::Bytes;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use kgraph_core::types::{Context, Node, RetryRoute};
+use once_cell::sync::OnceCell;
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
 };
 
 pub(crate) const STATUSES: &[&str] = &[
@@ -176,18 +178,22 @@ struct Paths<'a> {
     state: Option<&'a Path>,
     report: Option<&'a Path>,
     project: Option<&'a Path>,
+    packet_bases: std::cell::OnceCell<Option<(PathBuf, PathBuf)>>,
     watch: &'a mut dyn FnMut(&Path),
 }
 impl Paths<'_> {
     fn packet(&mut self, v: &Value) -> Option<PathBuf> {
-        live::resolve_packet(
-            v.as_str()?,
-            &live::resolve(self.state?).ok()?,
-            &live::resolve(self.report?).ok()?,
-            self.project,
-            self.watch,
-        )
-        .ok()
+        let raw = v.as_str()?;
+        let (state, report) = self
+            .packet_bases
+            .get_or_init(|| {
+                Some((
+                    live::resolve(self.state?).ok()?,
+                    live::resolve(self.report?).ok()?,
+                ))
+            })
+            .as_ref()?;
+        live::resolve_packet(raw, state, report, self.project, self.watch).ok()
     }
     fn watch_output(&mut self, packet_path: &Path, packet: &Value) {
         if let Some(state) = self.state {
@@ -448,7 +454,7 @@ fn cached_paths(report: &Value, records: &Map<String, Value>) -> HashSet<String>
         HashSet::new()
     }
 }
-fn aggregate(nodes: &[Value]) -> &str {
+fn aggregate(nodes: &[Value]) -> &'static str {
     if nodes.is_empty() {
         return "pending";
     }
@@ -535,7 +541,7 @@ fn retry_edge(children: &[Value], route: Option<&RetryRoute>, retries: &Value) -
     })
 }
 struct Tree<'a> {
-    records: Map<String, Value>,
+    records: &'a Map<String, Value>,
     paths: HashMap<String, BTreeSet<String>>,
     cached: HashSet<String>,
     report_time: DateTime<Utc>,
@@ -556,7 +562,7 @@ impl Tree<'_> {
         // Definitions retain their first position if a splitter emits a
         // repeated ID, with the last definition supplying the node fields.
         let by_id: HashMap<_, _> = defined.iter().map(|n| (n.id(), n)).collect();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::with_capacity(defined.len());
         let mut children: Vec<_> = defined
             .iter()
             .filter(|n| seen.insert(n.id()))
@@ -591,7 +597,7 @@ impl Tree<'_> {
         (nodes, edges)
     }
     fn node(&mut self, id: &str, path: &str, def: Option<&Node>, include_recorded: bool) -> Value {
-        let r = self.records.get(path).cloned().unwrap_or_default();
+        let r = self.records.get(path).unwrap_or(&Value::Null);
         let node_type = def.map(Node::snapshot_node_type).unwrap_or_else(|| {
             let k = s(r.get("node_type").unwrap_or(&r["kind"]));
             if CONTAINERS.contains(&k) {
@@ -669,7 +675,7 @@ impl Tree<'_> {
         if !STATUSES.contains(&status) {
             status = aggregate(&children);
         }
-        let mut updated = time_value(&r);
+        let mut updated = time_value(r);
         if status == "passed" && self.cached.contains(path) && stamp(updated) <= self.report_time {
             status = "cached";
         }
@@ -710,9 +716,9 @@ impl Tree<'_> {
             "detail": redact_detail(&r["detail"]),
             "started_at": r["started_at"],
             "updated_at": updated,
-            "children": children,
-            "edges": edges,
         });
+        n["children"] = Value::Array(children);
+        n["edges"] = Value::Array(edges);
         if let Some(entry) = self.progress.get(path) {
             let (graph, summary) = live::build_node_sub_graph(
                 path,
@@ -747,11 +753,14 @@ fn build(
 ) -> Value {
     let mut warnings = Vec::new();
     let overview = read_telemetry(report, &mut warnings);
-    let telemetry = read_telemetry(state, &mut warnings);
-    let mut records: Map<_, _> = pairs(&telemetry["nodes"])
-        .filter(|(p, r)| p.split('/').all(|p| !p.is_empty()) && r.is_object())
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let mut telemetry = read_telemetry(state, &mut warnings);
+    let mut records = telemetry
+        .get_mut("nodes")
+        .and_then(Value::as_object_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    records
+        .retain(|path, record| path.split('/').all(|part| !part.is_empty()) && record.is_object());
     budget_block(&mut records, &overview);
     let progress = state
         .map(|p| live::read_node_progress(p, &mut warnings))
@@ -779,7 +788,7 @@ fn build(
     let cached = cached_paths(&overview, &records);
     let report_time = stamp(&overview["generated_at"]);
     let mut tree = Tree {
-        records,
+        records: &records,
         paths,
         cached,
         report_time,
@@ -830,6 +839,7 @@ fn build(
             state,
             report,
             project,
+            packet_bases: Default::default(),
             watch,
         },
     );
@@ -843,14 +853,15 @@ fn build(
             v
         })
         .collect::<Vec<_>>();
+    let counts = tree.counts;
     let mut snapshot = json!({
         "version": 1,
         "title": title,
         "status": status,
-        "counts": tree.counts,
-        "nodes": nodes,
-        "edges": edges,
-        "attention": att,
+        "counts": null,
+        "nodes": null,
+        "edges": null,
+        "attention": null,
         "summary": overview["summary"].as_object().cloned().unwrap_or_default(),
         "scope": overview["scope"].as_object().cloned().unwrap_or_default(),
         "failure_signatures": failures,
@@ -862,6 +873,10 @@ fn build(
         "generated_at": live::now(),
         "warning": (!warnings.is_empty()).then(||warnings.join(" • ")),
     });
+    snapshot["counts"] = Value::Object(counts);
+    snapshot["nodes"] = Value::Array(nodes);
+    snapshot["edges"] = Value::Array(edges);
+    snapshot["attention"] = att;
     if overview["telemetry_summary"].is_object() {
         snapshot["telemetry_summary"] = overview["telemetry_summary"].clone();
     }
@@ -1032,50 +1047,151 @@ fn windows_signature(path: &Path) -> Option<Signature> {
 
 pub type DefinitionLoader = Arc<dyn Fn() -> Result<(Vec<Node>, Context), String> + Send + Sync>;
 pub type SnapshotProvider = Arc<dyn Fn() -> Result<Value, String> + Send + Sync>;
+struct Snapshot {
+    value: Arc<Value>,
+    expires_at: Option<DateTime<Utc>>,
+    // Keep distinct representations for authenticated and read-only viewers.
+    bytes: [OnceCell<Bytes>; 2],
+}
+
+#[derive(PartialEq)]
+struct GraphKey {
+    workflow: Option<(PathBuf, Option<Signature>)>,
+    context: Option<(PathBuf, Option<Signature>)>,
+}
+
 #[derive(Default)]
 struct Cache {
-    graph_key: Option<Vec<(PathBuf, Option<Signature>)>>,
+    graph_key: Option<GraphKey>,
     definition: Option<(Vec<Node>, Context)>,
     workflow_title: Option<String>,
     watched: HashMap<PathBuf, Option<Signature>>,
-    snapshot: Option<Value>,
+    snapshot: Option<Arc<Snapshot>>,
 }
-pub fn cached_town_snapshot(
+
+impl Cache {
+    fn current(&self, graph_key: &GraphKey) -> Option<&Arc<Snapshot>> {
+        let snapshot = self.snapshot.as_ref()?;
+        (self.graph_key.as_ref() == Some(graph_key)
+            && snapshot.expires_at.is_none_or(|at| at > Utc::now())
+            && self
+                .watched
+                .iter()
+                .all(|(path, sig)| signature(path) == *sig))
+        .then_some(snapshot)
+    }
+}
+
+pub struct CachedSnapshotProvider {
     workflow: Option<PathBuf>,
     state: Option<PathBuf>,
     report: Option<PathBuf>,
     context_file: Option<PathBuf>,
     title: Option<String>,
     loader: Option<DefinitionLoader>,
-) -> SnapshotProvider {
-    let cache = Mutex::new(Cache::default());
-    Arc::new(move || {
+    recorded_only: bool,
+    cache: RwLock<Cache>,
+}
+
+impl CachedSnapshotProvider {
+    pub fn new(
+        workflow: Option<PathBuf>,
+        state: Option<PathBuf>,
+        report: Option<PathBuf>,
+        context_file: Option<PathBuf>,
+        title: Option<String>,
+        loader: Option<DefinitionLoader>,
+    ) -> Self {
+        Self {
+            workflow,
+            state,
+            report,
+            context_file,
+            title,
+            loader,
+            recorded_only: false,
+            cache: RwLock::new(Cache::default()),
+        }
+    }
+
+    /// Use checkpoint topology for workflows without a native definition loader.
+    pub fn recorded_only(mut self) -> Self {
+        self.recorded_only = true;
+        self
+    }
+
+    fn graph_key(&self) -> GraphKey {
+        let key = |p: &Path| {
+            (
+                live::resolve(p).unwrap_or_else(|_| p.to_owned()),
+                signature(p),
+            )
+        };
+        GraphKey {
+            workflow: self.workflow.as_deref().map(key),
+            context: self.context_file.as_deref().map(key),
+        }
+    }
+
+    pub fn value(&self) -> Result<Arc<Value>, String> {
+        Ok(self.snapshot()?.value.clone())
+    }
+
+    pub(crate) fn warm_bytes(&self, read_only: bool) -> Option<Bytes> {
+        // Never wait on a rebuild on the async request thread.
+        let cache = self.cache.try_read().ok()?;
+        let bytes = cache.snapshot.as_ref()?.bytes[usize::from(read_only)].get()?;
+        cache.current(&self.graph_key())?;
+        Some(bytes.clone())
+    }
+
+    pub(crate) fn json_bytes(&self, read_only: bool) -> Result<Bytes, String> {
+        let snapshot = self.snapshot()?;
+        snapshot.bytes[usize::from(read_only)]
+            .get_or_try_init(|| {
+                let bytes = if read_only {
+                    serde_json::to_vec(&disable_responses(&snapshot.value))
+                } else {
+                    serde_json::to_vec(&*snapshot.value)
+                };
+                bytes.map(Bytes::from).map_err(|err| err.to_string())
+            })
+            .cloned()
+    }
+
+    fn snapshot(&self) -> Result<Arc<Snapshot>, String> {
+        let Self {
+            workflow,
+            state,
+            report,
+            title,
+            loader,
+            context_file,
+            ..
+        } = self;
         if workflow.is_none() && state.is_none() {
             return Err("Provide a workflow or a state file".into());
         }
-        let mut cache = cache
-            .lock()
-            .map_err(|_| "Snapshot cache lock is poisoned")?;
-        let graph_key: Vec<_> = workflow
-            .iter()
-            .chain(context_file.iter())
-            .map(|p| (live::resolve(p).unwrap_or_else(|_| p.clone()), signature(p)))
-            .collect();
-        if cache.graph_key.as_ref() == Some(&graph_key)
-            && cache.watched.iter().all(|(p, s)| signature(p) == *s)
         {
-            if let Some(s) = &cache.snapshot {
-                let now = Utc::now();
-                if array(&s["leases"])
-                    .iter()
-                    .all(|l| stamp(&l["expires_at"]) > now)
-                {
-                    return Ok(s.clone());
-                }
+            let cache = self
+                .cache
+                .read()
+                .map_err(|_| "Snapshot cache lock is poisoned")?;
+            if let Some(snapshot) = cache.current(&self.graph_key()) {
+                return Ok(snapshot.clone());
             }
         }
+        let mut cache = self
+            .cache
+            .write()
+            .map_err(|_| "Snapshot cache lock is poisoned")?;
+        let graph_key = self.graph_key();
+        if let Some(snapshot) = cache.current(&graph_key) {
+            return Ok(snapshot.clone());
+        }
         if cache.graph_key.as_ref() != Some(&graph_key) {
-            let (definition, workflow_title) = match (&loader, &workflow) {
+            let (definition, workflow_title) = match (loader, workflow) {
+                _ if self.recorded_only => (None, None),
                 (Some(load), _) => (Some(load()?), None),
                 (None, Some(path)) => {
                     let graph = kgraph_subgraphs::declarative::load_declarative_workflow(
@@ -1099,14 +1215,15 @@ pub fn cached_town_snapshot(
         for p in state.iter().chain(report.iter()) {
             watch(p);
         }
-        if let Some(s) = &state {
+        if let Some(s) = state {
             watch(&live::progress_path_for_state(s));
         }
-        let workflow = workflow
+        let resolved_workflow = cache
+            .graph_key
             .as_ref()
-            .map(|p| live::resolve(p).unwrap_or_else(|_| p.clone()));
+            .and_then(|key| key.workflow.as_ref());
         let v = build(
-            workflow.as_deref(),
+            resolved_workflow.map(|(path, _)| path.as_path()),
             state.as_deref(),
             report.as_deref(),
             cache.definition.as_ref().map(|(n, c)| (n.as_slice(), c)),
@@ -1115,10 +1232,31 @@ pub fn cached_town_snapshot(
             None,
             &mut watch,
         );
-        cache.snapshot = Some(v.clone());
+        let snapshot = Arc::new(Snapshot {
+            expires_at: array(&v["leases"])
+                .iter()
+                .map(|l| stamp(&l["expires_at"]))
+                .min(),
+            value: Arc::new(v),
+            bytes: Default::default(),
+        });
+        cache.snapshot = Some(snapshot.clone());
         cache.watched = watched;
-        Ok(v)
-    })
+        Ok(snapshot)
+    }
+}
+
+pub fn cached_town_snapshot(
+    workflow: Option<PathBuf>,
+    state: Option<PathBuf>,
+    report: Option<PathBuf>,
+    context_file: Option<PathBuf>,
+    title: Option<String>,
+    loader: Option<DefinitionLoader>,
+) -> SnapshotProvider {
+    let provider =
+        CachedSnapshotProvider::new(workflow, state, report, context_file, title, loader);
+    Arc::new(move || Ok((*provider.value()?).clone()))
 }
 
 #[cfg(test)]
@@ -1285,7 +1423,7 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok((vec![task("work", TaskKind::Gate)], Context::new()))
         });
-        let provider = cached_town_snapshot(
+        let provider = CachedSnapshotProvider::new(
             Some(workflow.clone()),
             Some(state.clone()),
             Some(report.clone()),
@@ -1293,7 +1431,12 @@ mod tests {
             None,
             Some(loader),
         );
-        let current = || provider().unwrap();
+        let current = || {
+            let snapshot = provider.value().unwrap();
+            let encoded = provider.json_bytes(false).unwrap();
+            assert_eq!(encoded.as_ref(), snapshot.to_string().as_bytes());
+            snapshot
+        };
         let initial = current();
         assert!(initial["attention"]["packet_path"].is_null());
         std::thread::scope(|scope| {
@@ -1314,6 +1457,7 @@ mod tests {
             .set_modified(old.modified().unwrap())
             .unwrap();
         assert_eq!(state.metadata().unwrap().len(), old.len());
+        assert!(provider.warm_bytes(false).is_none());
         assert_eq!(current()["nodes"][0]["detail"], "B");
         write_json(
             &first,
@@ -1342,6 +1486,14 @@ mod tests {
         live::ask_node_question(&state, "work", "review", &json!({"question":"Confirm?"})).unwrap();
         let snapshot = current();
         let disabled = disable_responses(&snapshot);
+        for (read_only, expected) in [(false, snapshot.as_ref()), (true, &disabled)] {
+            let bytes = provider.json_bytes(read_only).unwrap();
+            assert_eq!(bytes.as_ref(), expected.to_string().as_bytes());
+            assert_eq!(
+                provider.warm_bytes(read_only).unwrap().as_ptr(),
+                bytes.as_ptr()
+            );
+        }
         assert_eq!(
             snapshot["nodes"][0]["sub_graph"]["nodes"][0]["input_gate"]["can_respond"],
             true
@@ -1353,6 +1505,8 @@ mod tests {
         );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
         write_json(&ctx, &json!({"different":true}), true).unwrap();
+        assert!(provider.warm_bytes(false).is_none());
+        assert!(provider.warm_bytes(true).is_none());
         current();
         write_json(&workflow, &json!({"revision":2}), true).unwrap();
         current();

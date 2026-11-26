@@ -1,17 +1,12 @@
 //! Atomic file helpers, safe identifier checks, and cross-process file locking.
 
 use fs2::FileExt;
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use tempfile::NamedTempFile;
-
-static ID_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$").expect("valid ID regex"));
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Guard holding an exclusive advisory lock on a sibling lock file.
 pub struct FileLock {
@@ -25,7 +20,12 @@ impl Drop for FileLock {
 }
 
 pub fn valid_id(value: &str) -> bool {
-    ID_RE.is_match(value)
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphanumeric() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 pub fn require_id(value: &str) -> Result<String, String> {
@@ -40,8 +40,8 @@ pub fn require_id(value: &str) -> Result<String, String> {
 
 pub fn read_object(path: &Path) -> Result<Map<String, Value>, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    let val: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Invalid JSON in {}: {}", path.display(), e))?;
+    let val: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("Invalid JSON in {}: {}", path.display(), e))?;
     match val {
         Value::Object(map) => Ok(map),
         _ => Err(format!("{} must contain a JSON object", path.display())),
@@ -101,7 +101,7 @@ pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf, String> {
     Ok(base)
 }
 
-fn sync_file(file: &File) -> std::io::Result<()> {
+pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
     // Rust's File::sync_all() and File::sync_data() both issue F_FULLFSYNC on
     // Apple platforms (~4.4 ms NVMe barrier per checkpoint). Call POSIX fsync
     // directly on Apple targets to match Python's os.fsync() durability and speed.
@@ -121,55 +121,101 @@ fn sync_file(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// Atomically write UTF-8 text via a temporary file in the same directory + fsync + rename.
-pub fn write_text(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create directory {}: {}", parent.display(), e))?;
+struct TempPath(Option<PathBuf>);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
         }
     }
+}
+
+/// Atomically replace a file with synced bytes from a sibling temporary file.
+pub fn write_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)
-        .map_err(|e| format!("Could not create temp file in {}: {}", dir.display(), e))?;
-    tmp.write_all(content.as_bytes())
+        .unwrap_or(Path::new("."));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut created_dir = false;
+    let (tmp, mut file) = loop {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".kgraph_tmp.{}.{seq}", std::process::id()));
+        if tmp.file_name() == path.file_name() {
+            continue;
+        }
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) if !created_dir && e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir)
+                    .map_err(|e| format!("Could not create directory {}: {}", dir.display(), e))?;
+                created_dir = true;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Could not create temp file in {}: {}",
+                    dir.display(),
+                    e
+                ))
+            }
+        }
+    };
+    let mut guard = TempPath(Some(tmp));
+    file.write_all(content)
         .map_err(|e| format!("Could not write temp file for {}: {}", path.display(), e))?;
-    sync_file(tmp.as_file())
+    sync_file(&file)
         .map_err(|e| format!("Could not sync temp file for {}: {}", path.display(), e))?;
-    tmp.persist(path)
-        .map_err(|e| format!("Could not persist {}: {}", path.display(), e.error))?;
+    drop(file);
+    fs::rename(guard.0.as_ref().unwrap(), path)
+        .map_err(|e| format!("Could not persist {}: {}", path.display(), e))?;
+    guard.0 = None;
     Ok(())
+}
+
+pub fn write_text(path: &Path, content: &str) -> Result<(), String> {
+    write_bytes(path, content.as_bytes())
 }
 
 /// Atomically serialize a value to JSON (pretty or compact) with a trailing newline.
 pub fn write_json<T: Serialize>(path: &Path, data: &T, pretty: bool) -> Result<(), String> {
-    let mut text = if pretty {
-        serde_json::to_string_pretty(data)
+    let mut bytes = Vec::with_capacity(4096);
+    if pretty {
+        serde_json::to_writer_pretty(&mut bytes, data)
     } else {
-        serde_json::to_string(data)
+        serde_json::to_writer(&mut bytes, data)
     }
     .map_err(|e| format!("JSON serialization error for {}: {}", path.display(), e))?;
-    text.push('\n');
-    write_text(path, &text)
+    bytes.push(b'\n');
+    write_bytes(path, &bytes)
 }
 
-/// Acquire an exclusive cross-process file lock on `path`.
-pub fn file_lock(path: &Path) -> Result<FileLock, String> {
+pub(crate) fn open_lock_file(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Could not create lock dir {}: {}", parent.display(), e))?;
         }
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("Could not open lock file {}: {}", path.display(), e))?;
+        .map_err(|e| format!("Could not open lock file {}: {}", path.display(), e))
+}
+
+/// Acquire an exclusive cross-process file lock on `path`.
+pub fn file_lock(path: &Path) -> Result<FileLock, String> {
+    let file = open_lock_file(path)?;
     file.lock_exclusive()
         .map_err(|e| format!("Could not lock {}: {}", path.display(), e))?;
     Ok(FileLock { file })

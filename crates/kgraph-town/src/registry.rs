@@ -8,8 +8,6 @@ use kgraph_core::{
     files::{file_lock, valid_id, write_json, FileLock},
     hash::{sha256_bytes, sha256_json},
 };
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -69,8 +67,9 @@ struct Inventory {
 impl Inventory {
     fn load() -> Result<Self, String> {
         let path = kgraph_home().join("registry.json");
-        match read_json(&path, None) {
-            Ok(doc) => serde_json::from_value(doc).map_err(|e| format!("{}: {e}", path.display())),
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("{}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !path.is_symlink() => {
                 Ok(Self::default())
             }
@@ -78,11 +77,19 @@ impl Inventory {
         }
     }
     fn save(&self) -> Result<(), String> {
-        let mut d = json!({"version":1,"runs":self.runs});
-        if !self.dismissed.is_empty() {
-            d["dismissed"] = json!(self.dismissed);
+        #[derive(serde::Serialize)]
+        struct InventoryRef<'a> {
+            version: u8,
+            runs: &'a Map<String, Value>,
+            #[serde(skip_serializing_if = "Map::is_empty")]
+            dismissed: &'a Map<String, Value>,
         }
-        write_json(&kgraph_home().join("registry.json"), &d, true)
+        let doc = InventoryRef {
+            version: 1,
+            runs: &self.runs,
+            dismissed: &self.dismissed,
+        };
+        write_json(&kgraph_home().join("registry.json"), &doc, true)
     }
 }
 pub(crate) fn registered_run(id: &str) -> Result<Option<Value>, String> {
@@ -97,14 +104,29 @@ fn remove_artifact(directory: &str, id: &str) -> Result<(), String> {
     }
 }
 fn slug(s: &str) -> String {
-    static SEP: Lazy<Regex> = Lazy::new(|| Regex::new("[^a-z0-9]+").unwrap());
-    let lowercase = s.to_lowercase();
-    let clean = SEP.replace_all(&lowercase, "-");
-    let result: String = clean.trim_matches('-').chars().take(48).collect();
-    if result.is_empty() {
+    let mut out = String::with_capacity(s.len().min(48));
+    let mut pending_dash = false;
+    for ch in s.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            if pending_dash && !out.is_empty() {
+                if out.len() >= 48 {
+                    break;
+                }
+                out.push('-');
+            }
+            pending_dash = false;
+            if out.len() >= 48 {
+                break;
+            }
+            out.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    if out.is_empty() {
         "run".into()
     } else {
-        result
+        out
     }
 }
 fn normcase(s: &str) -> String {

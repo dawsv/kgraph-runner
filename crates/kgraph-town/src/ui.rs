@@ -127,19 +127,21 @@ impl Formatter for TownJson {
         )
     }
     fn write_string_fragment<W: Write + ?Sized>(&mut self, w: &mut W, s: &str) -> io::Result<()> {
-        for unit in s.encode_utf16() {
-            if unit >= 127 {
+        let mut rest = s;
+        while let Some(index) = rest.bytes().position(|b| b >= 127) {
+            w.write_all(&rest.as_bytes()[..index])?;
+            let ch = rest[index..].chars().next().unwrap();
+            for unit in ch.encode_utf16(&mut [0; 2]) {
                 write!(w, "\\u{unit:04x}")?;
-            } else {
-                w.write_all(&[unit as u8])?;
             }
+            rest = &rest[index + ch.len_utf8()..];
         }
-        Ok(())
+        w.write_all(rest.as_bytes())
     }
 }
 
 pub(crate) fn python_json(data: &impl Serialize) -> Result<String, String> {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(64 * 1024);
     data.serialize(&mut serde_json::Serializer::with_formatter(
         &mut bytes, TownJson,
     ))
@@ -148,9 +150,11 @@ pub(crate) fn python_json(data: &impl Serialize) -> Result<String, String> {
 }
 
 fn json_script(data: &impl Serialize) -> Result<String, String> {
-    Ok(python_json(data)?
-        .replace("</", r"<\/")
-        .replace("<!--", r"\u003c!--"))
+    let json = python_json(data)?;
+    if !json.contains('<') {
+        return Ok(json);
+    }
+    Ok(json.replace("</", r"<\/").replace("<!--", r"\u003c!--"))
 }
 
 fn escape(value: &str) -> String {
@@ -183,7 +187,10 @@ fn quoted_string(value: &str) -> String {
                 repr.push('\\');
                 repr.push(c);
             }
-            c if c != ' ' && NON_PRINTING.is_match(c.encode_utf8(&mut [0; 4])) => {
+            c if c != ' '
+                && (c.is_ascii_control()
+                    || (!c.is_ascii() && NON_PRINTING.is_match(c.encode_utf8(&mut [0; 4])))) =>
+            {
                 let n = c as u32;
                 if n <= 255 {
                     write!(repr, "\\x{n:02x}").unwrap();
@@ -292,31 +299,58 @@ pub fn render_town_html(snapshot: &Value, opts: &RenderTownOptions<'_>) -> Resul
         ""
     };
     let devices = device_menu(opts.access_urls);
-    Ok(format!(
+    let mut html = String::with_capacity(
+        STYLES.len()
+            + SCRIPT.len()
+            + EMBLEM.len()
+            + SCENERY.len()
+            + HEROES.len()
+            + initial.len()
+            + options.len()
+            + devices.len()
+            + 8192,
+    );
+    for part in [
         r##"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  {meta}
-  <title>{title} | Hero Town</title>
-  <style>{STYLES}</style>
+  "##,
+        meta,
+        r##"
+  <title>"##,
+        &title,
+        r##" | Hero Town</title>
+  <style>"##,
+        STYLES,
+        r##"</style>
 </head>
-<body class="{shell}" data-theme="day">
+<body class=""##,
+        shell,
+        r##"" data-theme="day">
 <main class="town">
   <header class="hud">
     <div class="hud-top">
       <div class="identity">
         <svg class="emblem" viewBox="0 0 56 56" aria-hidden="true">
-          {EMBLEM}
+          "##,
+        EMBLEM,
+        r##"
         </svg>
-        <div><p class="wordmark">Hero Town</p><h1 id="workflow-title">{title}</h1></div>
+        <div><p class="wordmark">Hero Town</p><h1 id="workflow-title">"##,
+        &title,
+        r##"</h1></div>
       </div>
       <div class="hud-actions">
         <span id="overall" class="overall">Pending</span>
-        {devices}
+        "##,
+        &devices,
+        r##"
       </div>
     </div>
-    {switcher}
+    "##,
+        switcher,
+        r##"
     <div class="hud-metrics">
       <span class="chip status-passed"><span class="dot"></span>Passed <b id="count-passed">0</b></span>
       <span class="chip status-cached"><span class="dot"></span>Cached <b id="count-cached">0</b></span>
@@ -348,12 +382,16 @@ pub fn render_town_html(snapshot: &Value, opts: &RenderTownOptions<'_>) -> Resul
     <ul class="attention-items" id="attention-items" aria-label="Action items" tabindex="0" hidden></ul>
   </section>
   <section class="stage" aria-label="Workflow map">
-    {SCENERY}
+    "##,
+        SCENERY,
+        r##"
     <div class="controls" role="group" aria-label="Map controls">
       <button class="zoom" id="zoom-in" aria-label="Zoom in">+</button>
       <button class="zoom" id="zoom-out" aria-label="Zoom out">−</button>
       <button id="fit-town">Fit Town</button>
-      <div class="layout-controls" role="group" aria-label="Town layout">{layouts}</div>
+      <div class="layout-controls" role="group" aria-label="Town layout">"##,
+        &layouts,
+        r##"</div>
       <button id="theme" aria-label="Night Patrol theme" aria-pressed="false">☾ Night Patrol</button>
       <div class="live-control" id="live-controls" hidden>
         <span class="chip live-label" id="live-badge" role="status"><span class="dot"></span><span id="live-text">Live</span></span>
@@ -362,7 +400,9 @@ pub fn render_town_html(snapshot: &Value, opts: &RenderTownOptions<'_>) -> Resul
       <nav id="drill-breadcrumbs" class="drill-breadcrumbs" aria-label="Sub-graph navigation" hidden></nav>
     </div>
     <svg id="viewport" class="viewport" aria-label="Workflow buildings and districts">
-      {HEROES}
+      "##,
+        HEROES,
+        r##"
       <g id="world"></g>
     </svg>
     <p class="empty" id="empty" hidden>No stages to display</p>
@@ -426,13 +466,22 @@ pub fn render_town_html(snapshot: &Value, opts: &RenderTownOptions<'_>) -> Resul
     <ul class="qa-cases" id="qa-cases" aria-label="Manual QA cases"></ul>
   </details>
 </main>
-<script type="application/json" id="town-snapshot">{initial}</script>
-<script type="application/json" id="town-options">{options}</script>
-<script>{SCRIPT}</script>
+<script type="application/json" id="town-snapshot">"##,
+        &initial,
+        r##"</script>
+<script type="application/json" id="town-options">"##,
+        &options,
+        r##"</script>
+<script>"##,
+        SCRIPT,
+        r##"</script>
 </body>
 </html>
-"##
-    ))
+"##,
+    ] {
+        html.push_str(part);
+    }
+    Ok(html)
 }
 
 #[cfg(test)]

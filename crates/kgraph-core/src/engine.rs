@@ -7,9 +7,11 @@ use crate::{
     types::*,
 };
 use chrono::{SecondsFormat, Utc};
+use fs2::FileExt;
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    fs::{self, File},
     panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
@@ -59,6 +61,8 @@ impl RunnerConfig {
 #[derive(Default)]
 struct Runtime {
     state: GraphState,
+    checkpoint: Option<Checkpoint>,
+    write_buf: Vec<u8>,
     retry_nodes: HashSet<String>,
     worker_calls: usize,
     efficiency: EfficiencyCounts,
@@ -68,9 +72,68 @@ struct Runtime {
     last: Option<String>,
 }
 
+type FileSignature = (u64, u64, i128, u64);
+
+fn file_signature(meta: &fs::Metadata) -> Option<FileSignature> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((
+            meta.dev(),
+            meta.ino(),
+            i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            meta.len(),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+struct Checkpoint {
+    path: PathBuf,
+    lock: File,
+    last_written_sig: Option<FileSignature>,
+    // A peer may have written nodes that are absent from this runner's local state.
+    merged: Option<GraphState>,
+}
+
+struct Unlock<'a>(&'a File);
+
+impl Drop for Unlock<'_> {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(self.0);
+    }
+}
+
+struct CompletedRun {
+    telemetry: RunTelemetry,
+    summarized: bool,
+    git_dirty_cwd: Option<PathBuf>,
+}
+
+impl CompletedRun {
+    fn summary(&mut self) -> &RunTelemetry {
+        if !self.summarized {
+            self.telemetry.summarize();
+            self.summarized = true;
+        }
+        &self.telemetry
+    }
+
+    fn resolve_dirty(&mut self) {
+        if let Some(cwd) = self.git_dirty_cwd.take() {
+            self.telemetry.git_dirty =
+                git_field(&cwd, &["status", "--porcelain"]).map(|s| !s.is_empty());
+        }
+    }
+}
+
 pub struct GraphRunner {
     config: RunnerConfig,
-    last_telemetry: Mutex<RunTelemetry>,
+    last_telemetry: Mutex<CompletedRun>,
     runtime: Mutex<Runtime>,
     resources: Mutex<HashMap<String, Arc<ResourceLock>>>,
     log_lock: Mutex<()>,
@@ -117,8 +180,9 @@ pub(crate) fn active_node_path() -> Option<String> {
     ACTIVE_NODE_PATH.with_borrow(Clone::clone)
 }
 
-fn git_field(args: &[&str]) -> Option<String> {
+fn git_field(cwd: &Path, args: &[&str]) -> Option<String> {
     let result = std::process::Command::new("git")
+        .current_dir(cwd)
         .arg("--no-optional-locks")
         .args(args)
         .output()
@@ -127,6 +191,97 @@ fn git_field(args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&result.stdout).trim().to_string())
+}
+
+// A linked worktree keeps HEAD in its own gitdir and branch refs in commondir.
+fn read_git_head(marker: &Path) -> Option<String> {
+    let dir = if marker.is_dir() {
+        marker.to_owned()
+    } else {
+        let pointer = fs::read_to_string(marker).ok()?;
+        marker
+            .parent()?
+            .join(pointer.trim_end().strip_prefix("gitdir: ")?)
+    };
+    let head = fs::read_to_string(dir.join("HEAD")).ok()?;
+    let valid_oid =
+        |s: &str| (s.len() == 40 || s.len() == 64) && s.bytes().all(|c| c.is_ascii_hexdigit());
+    let head = head.trim();
+    if valid_oid(head) {
+        return Some(head.to_ascii_lowercase());
+    }
+    let name = head.strip_prefix("ref: refs/")?;
+    if !name.split('/').all(|part| !matches!(part, "" | "." | "..")) {
+        return None;
+    }
+    let reference = head.strip_prefix("ref: ")?;
+    let common = match fs::read_to_string(dir.join("commondir")) {
+        Ok(path) => dir.join(path.trim_end()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => dir.clone(),
+        Err(_) => return None,
+    };
+    let base = if ["bisect/", "worktree/", "rewritten/"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        &dir
+    } else {
+        &common
+    };
+    match fs::read_to_string(base.join(reference)) {
+        Ok(oid) => return valid_oid(oid.trim()).then(|| oid.trim().to_ascii_lowercase()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(_) => return None,
+    }
+    fs::read_to_string(common.join("packed-refs"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            let (oid, name) = line.split_once(' ')?;
+            (name == reference && valid_oid(oid)).then(|| oid.to_ascii_lowercase())
+        })
+}
+
+pub fn spawn_git_dirty_probe() -> Option<thread::JoinHandle<Option<bool>>> {
+    let (_, dirty_cwd) = git_provenance(Some(String::new()), None);
+    let cwd = dirty_cwd?;
+    thread::Builder::new()
+        .spawn(move || git_field(&cwd, &["status", "--porcelain"]).map(|s| !s.is_empty()))
+        .ok()
+}
+
+fn git_provenance(head: Option<String>, dirty: Option<bool>) -> (Option<String>, Option<PathBuf>) {
+    if head.is_some() && dirty.is_some() {
+        return (head, None);
+    }
+    let Ok(cwd) = std::env::current_dir() else {
+        return (head, None);
+    };
+    // Explicit repository selection and discovery overrides are handled by Git itself.
+    let customized = [
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_NAMESPACE",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some());
+    let marker = cwd
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|p| p.exists());
+    if marker.is_none() && !customized {
+        return (head, None);
+    }
+    let head = head.or_else(|| {
+        if !customized {
+            if let Some(oid) = marker.as_deref().and_then(read_git_head) {
+                return Some(oid);
+            }
+        }
+        git_field(&cwd, &["rev-parse", "--verify", "HEAD"])
+    });
+    (head, dirty.is_none().then_some(cwd))
 }
 
 fn context_usage(ctx: &Context, path: &str) -> Option<AgentUsage> {
@@ -330,7 +485,7 @@ fn metadata<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 }
 
 fn node_index(nodes: &[Node]) -> Result<HashMap<&str, usize>, String> {
-    let mut ids = HashMap::new();
+    let mut ids = HashMap::with_capacity(nodes.len());
     for (i, n) in nodes.iter().enumerate() {
         if ids.insert(n.id(), i).is_some() {
             return Err(format!("Duplicate node ID '{}'", n.id()));
@@ -339,13 +494,13 @@ fn node_index(nodes: &[Node]) -> Result<HashMap<&str, usize>, String> {
     Ok(ids)
 }
 
-fn ordered_nodes(nodes: &[Node]) -> Result<Vec<Node>, String> {
-    fn visit(
+fn ordered_nodes(nodes: &[Node]) -> Result<Vec<&Node>, String> {
+    fn visit<'a>(
         i: usize,
-        nodes: &[Node],
+        nodes: &'a [Node],
         ids: &HashMap<&str, usize>,
         visited: &mut [u8],
-        order: &mut Vec<Node>,
+        order: &mut Vec<&'a Node>,
     ) -> Result<(), String> {
         let n = &nodes[i];
         match visited[i] {
@@ -360,7 +515,7 @@ fn ordered_nodes(nodes: &[Node]) -> Result<Vec<Node>, String> {
             visit(j, nodes, ids, visited, order)?;
         }
         visited[i] = 2;
-        order.push(n.clone());
+        order.push(n);
         Ok(())
     }
     let ids = node_index(nodes)?;
@@ -396,10 +551,14 @@ impl GraphRunner {
             ..Default::default()
         };
         Ok(Self {
-            last_telemetry: Mutex::new(RunTelemetry {
-                version: 1,
-                state_path: config.state_path.display().to_string(),
-                ..Default::default()
+            last_telemetry: Mutex::new(CompletedRun {
+                git_dirty_cwd: None,
+                summarized: true,
+                telemetry: RunTelemetry {
+                    version: 1,
+                    state_path: config.state_path.display().to_string(),
+                    ..Default::default()
+                },
             }),
             config,
             runtime: Mutex::new(runtime),
@@ -445,30 +604,76 @@ impl GraphRunner {
 
     fn record(&self, path: &str, entry: Value, trace: bool) -> Result<(), GraphFailure> {
         let mut rt = lock(&self.runtime);
+        let Runtime {
+            state,
+            checkpoint,
+            write_buf,
+            trace: events,
+            ..
+        } = &mut *rt;
         let save = || -> Result<(), String> {
-            let state_path = state_destination(&self.config.state_path)?;
-            let mut lock_path = state_path.as_os_str().to_owned();
-            lock_path.push(".lock");
-            let _file_guard = files::file_lock(Path::new(&lock_path))?;
-            let mut disk = if state_path.try_exists().map_err(|e| e.to_string())? {
-                read_state(&state_path)?
-            } else {
-                rt.state.clone()
-            };
-            disk.nodes.insert(path.into(), entry.clone());
-            let text = serde_json::to_string_pretty(&disk).map_err(|e| e.to_string())?;
-            files::write_text(&state_path, &(text + "\n"))
+            if checkpoint.is_none() {
+                let path = state_destination(
+                    &std::path::absolute(&self.config.state_path).map_err(|e| e.to_string())?,
+                )?;
+                let mut lock_path = path.as_os_str().to_owned();
+                lock_path.push(".lock");
+                let lock = files::open_lock_file(Path::new(&lock_path))?;
+                *checkpoint = Some(Checkpoint {
+                    path,
+                    lock,
+                    last_written_sig: None,
+                    merged: None,
+                });
+            }
+            let checkpoint = checkpoint.as_mut().unwrap();
+            checkpoint
+                .lock
+                .lock_exclusive()
+                .map_err(|e| e.to_string())?;
+            let _guard = Unlock(&checkpoint.lock);
+            match fs::metadata(&checkpoint.path) {
+                Ok(meta)
+                    if checkpoint.last_written_sig.is_some()
+                        && file_signature(&meta) == checkpoint.last_written_sig => {}
+                Ok(_) => checkpoint.merged = Some(read_state(&checkpoint.path)?),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => checkpoint.merged = None,
+                Err(e) => return Err(e.to_string()),
+            }
+            let disk = checkpoint.merged.as_mut().unwrap_or(state);
+            let previous = disk.nodes.insert(path.into(), entry);
+            write_buf.clear();
+            let result = serde_json::to_writer_pretty(&mut *write_buf, &disk)
+                .map_err(|e| e.to_string())
+                .and_then(|()| {
+                    write_buf.push(b'\n');
+                    files::write_bytes(&checkpoint.path, write_buf)
+                });
+            if let Err(e) = result {
+                if let Some(previous) = previous {
+                    disk.nodes.insert(path.into(), previous);
+                } else {
+                    disk.nodes.remove(path);
+                }
+                checkpoint.last_written_sig = None;
+                return Err(e);
+            }
+            checkpoint.last_written_sig = fs::metadata(&checkpoint.path)
+                .ok()
+                .and_then(|m| file_signature(&m));
+            if let Some(merged) = &checkpoint.merged {
+                state.nodes.insert(path.into(), merged.nodes[path].clone());
+            }
+            if trace {
+                events.push(extend(json!({"node":path}), state.nodes[path].clone()));
+            }
+            Ok(())
         };
-        save().map_err(|e| GraphFailure::new(path, e))?;
-        if trace {
-            rt.trace.push(extend(json!({"node":path}), entry.clone()));
-        }
-        rt.state.nodes.insert(path.into(), entry);
-        Ok(())
+        save().map_err(|e| GraphFailure::new(path, e))
     }
 
     pub fn topo_sort(&self, nodes: &[Node]) -> Result<Vec<Node>, String> {
-        ordered_nodes(nodes)
+        Ok(ordered_nodes(nodes)?.into_iter().cloned().collect())
     }
 
     fn resolve_until(
@@ -572,28 +777,38 @@ impl GraphRunner {
             {
                 return (false, "retry_requested".into());
             }
-            rt.state.nodes.get(full_path).cloned()
+            let Some(rec) = rt
+                .state
+                .nodes
+                .get(full_path)
+                .filter(|v| v.as_object().is_some_and(|m| !m.is_empty()))
+            else {
+                return (false, "no_prior_state".into());
+            };
+            if rec["status"] != "passed" {
+                return (
+                    false,
+                    format!("prior_status:{}", rec["status"].as_str().unwrap_or("None")),
+                );
+            }
+            if rec["input_hash"] != in_hash {
+                return (false, "input_hash_changed".into());
+            }
+            if outputs.is_empty() {
+                return (true, "fresh".into());
+            }
+            rec.get("output_hashes").cloned()
         };
-        let Some(rec) = record.filter(|v| v.as_object().is_some_and(|m| !m.is_empty())) else {
-            return (false, "no_prior_state".into());
-        };
-        if rec["status"] != "passed" {
-            return (
-                false,
-                format!("prior_status:{}", rec["status"].as_str().unwrap_or("None")),
-            );
-        }
-        if rec["input_hash"] != in_hash {
-            return (false, "input_hash_changed".into());
-        }
         for p in outputs {
             if !p.exists() {
                 return (false, format!("missing_output:{}", p.display()));
             }
         }
         for p in outputs {
-            if let Some(sha) = rec["output_hashes"][p.to_string_lossy().as_ref()]
-                .as_str()
+            if let Some(sha) = record
+                .as_ref()
+                .and_then(|hashes| hashes.get(p.to_string_lossy().as_ref()))
+                .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
                 if p.is_file() && hash::sha256_file(p).as_deref() != Ok(sha) {
@@ -611,10 +826,10 @@ impl GraphRunner {
         prefix: &str,
     ) -> Result<Vec<PlanEntry>, GraphFailure> {
         let until = self.resolve_until(root_nodes, prefix, true)?;
-        let mut entries = Vec::new();
+        let mut entries = Vec::with_capacity(root_nodes.len());
         let ordered = ordered_nodes(root_nodes).map_err(|e| GraphFailure::new(prefix, e))?;
         self.plan_nodes(
-            &ordered,
+            ordered,
             &ctx.shallow_clone(),
             prefix,
             until.as_deref(),
@@ -623,9 +838,9 @@ impl GraphRunner {
         Ok(entries)
     }
 
-    fn plan_nodes(
+    fn plan_nodes<'a>(
         &self,
-        nodes: &[Node],
+        nodes: impl IntoIterator<Item = &'a Node>,
         ctx: &Context,
         prefix: &str,
         until: Option<&str>,
@@ -633,34 +848,27 @@ impl GraphRunner {
     ) -> Result<bool, GraphFailure> {
         for n in nodes {
             let path = path_for(prefix, n.id());
-            let mut entry = PlanEntry {
-                path: path.clone(),
-                id: n.id().into(),
-                node_type: n.node_type_name().into(),
-                kind: n.kind_str().into(),
-                deps: n.deps().to_vec(),
-                resource: n.resource().map(String::from),
-                status: "container".into(),
-                reason: None,
-                detail: None,
-            };
+            let mut status = "container";
+            let mut reason = None;
+            let mut detail = None;
             let mut children = Vec::new();
+            let mut ordered = Vec::new();
             match n {
                 Node::Task(task) => {
                     let inputs =
                         callback(|| Ok(((task.input_hash_fn)(ctx)?, (task.outputs_fn)(ctx)?)))
                             .map_err(|e| GraphFailure::new(&path, e))?;
-                    let (fresh, reason) = match inputs {
+                    let (fresh, cache_reason) = match inputs {
                         Ok((hash, outputs)) => {
                             self.freshness_reason(&path, n.id(), &hash, &outputs, task.cacheable)
                         }
-                        Err(detail) => {
-                            entry.detail = Some(detail);
+                        Err(error) => {
+                            detail = Some(error);
                             (false, "inputs_unavailable".into())
                         }
                     };
-                    entry.status = if fresh { "cached" } else { "will_run" }.into();
-                    entry.reason = Some(reason);
+                    status = if fresh { "cached" } else { "will_run" };
+                    reason = Some(cache_reason);
                 }
                 Node::Splitter(split) => match callback(|| build_children(split, ctx))
                     .map_err(|e| GraphFailure::new(&path, e))?
@@ -669,17 +877,32 @@ impl GraphRunner {
                         node_index(&items).map_err(|e| GraphFailure::new(&path, e))?;
                         children = items;
                     }
-                    Err(detail) => entry.detail = Some(detail),
+                    Err(error) => detail = Some(error),
                 },
                 _ => {
-                    children = ordered_nodes(static_children(n).unwrap_or_default())
+                    ordered = ordered_nodes(static_children(n).unwrap_or_default())
                         .map_err(|e| GraphFailure::new(&path, e))?
                 }
             }
-            entries.push(entry);
-            if self.plan_nodes(&children, ctx, &path, until, entries)?
-                || Some(path.as_str()) == until
-            {
+            let stop = Some(path.as_str()) == until;
+            let child_prefix = (!children.is_empty() || !ordered.is_empty()).then(|| path.clone());
+            entries.push(PlanEntry {
+                path,
+                id: n.id().into(),
+                node_type: n.node_type_name().into(),
+                kind: n.kind_str().into(),
+                deps: n.deps().to_vec(),
+                resource: n.resource().map(String::from),
+                status: status.into(),
+                reason,
+                detail,
+            });
+            if let Some(prefix) = child_prefix {
+                if self.plan_nodes(children.iter().chain(ordered), ctx, &prefix, until, entries)? {
+                    return Ok(true);
+                }
+            }
+            if stop {
                 return Ok(true);
             }
         }
@@ -701,16 +924,23 @@ impl GraphRunner {
         use std::sync::atomic::{AtomicU64, Ordering};
         static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
         let string_field = |key| ctx.get(key).and_then(|v| v.as_str().map(str::to_owned));
-        let git_head =
-            string_field("git_head").or_else(|| git_field(&["rev-parse", "--verify", "HEAD"]));
-        let git_dirty = ctx
-            .get("git_dirty")
-            .and_then(|v| v.as_bool())
-            .or_else(|| git_field(&["status", "--porcelain"]).map(|status| !status.is_empty()));
+        let git_dirty = ctx.get("git_dirty").and_then(|v| v.as_bool());
+        let (git_head, git_dirty_cwd) = git_provenance(string_field("git_head"), git_dirty);
+        let dirty_worker = git_dirty_cwd
+            .as_ref()
+            .filter(|_| self.config.telemetry_path.is_some())
+            .and_then(|cwd| {
+                let cwd = cwd.clone();
+                thread::Builder::new()
+                    .spawn(move || {
+                        git_field(&cwd, &["status", "--porcelain"]).map(|s| !s.is_empty())
+                    })
+                    .ok()
+            });
         let started_at = now();
         let clock = RunClock {
             start: Instant::now(),
-            nodes: Mutex::default(),
+            nodes: Mutex::new(Vec::with_capacity(root_nodes.len())),
         };
         let mut run = RunTelemetry {
             version: 1,
@@ -754,13 +984,24 @@ impl GraphRunner {
         run.nodes = clock.nodes.into_inner().unwrap_or_else(|e| e.into_inner());
         run.status = status.into();
         run.exit_code = exit_code;
-        run.summarize();
+        let git_dirty_cwd = if let Some(worker) = dirty_worker {
+            run.git_dirty = worker.join().ok().flatten();
+            None
+        } else {
+            git_dirty_cwd
+        };
+        let mut completed = CompletedRun {
+            telemetry: run,
+            summarized: false,
+            git_dirty_cwd,
+        };
         if let Some(path) = &self.config.telemetry_path {
             if same_report_target(path, &self.config.state_path) == Ok(false) {
-                let _ = telemetry::append_run_telemetry(path, &run);
+                completed.resolve_dirty();
+                let _ = telemetry::append_run_telemetry(path, completed.summary());
             }
         }
-        *lock(&self.last_telemetry) = run;
+        *lock(&self.last_telemetry) = completed;
         self.emit("run_end", json!({"status":status,"error":error}));
         result.map(|()| ctx.clone())
     }
@@ -772,7 +1013,27 @@ impl GraphRunner {
         exit_code: i32,
         workflow_ref: Option<&str>,
     ) -> RunTelemetry {
-        let mut result = lock(&self.last_telemetry).clone();
+        self.build_run_telemetry_with_git_dirty(status, exit_code, workflow_ref, None)
+    }
+
+    /// Snapshot the most recently completed run using a precomputed `git_dirty` probe when available.
+    pub fn build_run_telemetry_with_git_dirty(
+        &self,
+        status: &str,
+        exit_code: i32,
+        workflow_ref: Option<&str>,
+        git_dirty_override: Option<Option<bool>>,
+    ) -> RunTelemetry {
+        let mut completed = lock(&self.last_telemetry);
+        if completed.git_dirty_cwd.is_some() {
+            if let Some(dirty) = git_dirty_override {
+                completed.git_dirty_cwd = None;
+                completed.telemetry.git_dirty = dirty;
+            } else {
+                completed.resolve_dirty();
+            }
+        }
+        let mut result = completed.summary().clone();
         result.status = status.into();
         result.exit_code = exit_code;
         if let Some(workflow) = workflow_ref {
@@ -790,14 +1051,18 @@ impl GraphRunner {
     ) -> Result<(), GraphFailure> {
         let ordered = ordered_nodes(nodes).map_err(|e| GraphFailure::new(prefix, e))?;
         let execute = |i: usize, ready: Instant| {
-            let n = &ordered[i];
-            self.execute(n, &path_for(prefix, n.id()), scope, ready)
+            let n = ordered[i];
+            if prefix.is_empty() {
+                self.execute(n, n.id(), scope, ready)
+            } else {
+                self.execute(n, &path_for(prefix, n.id()), scope, ready)
+            }
         };
         if !scope.held.is_empty()
             || self.config.max_parallel_nodes == 1
             || lock(&self.runtime).until_path.is_some()
         {
-            let mut finished = HashMap::new();
+            let mut finished = HashMap::with_capacity(ordered.len());
             for (i, node) in ordered.iter().enumerate() {
                 let ready = node
                     .deps()
@@ -813,7 +1078,11 @@ impl GraphRunner {
             }
             return Ok(());
         }
-        let ids = node_index(&ordered).map_err(|e| GraphFailure::new(prefix, e))?;
+        let ids: HashMap<_, _> = ordered
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id(), i))
+            .collect();
         let deps = ordered
             .iter()
             .map(|node| node.deps().iter().map(|dep| ids[dep.as_str()]).collect())
@@ -850,7 +1119,6 @@ impl GraphRunner {
             kind: kind.into(),
             deps: node.deps().to_vec(),
             resource: node.resource().map(str::to_owned),
-            started_at: now(),
             ..Default::default()
         };
         let result = (|| {
@@ -1047,10 +1315,12 @@ impl GraphRunner {
             lock(&self.runtime)
                 .trace
                 .push(json!({"node":path,"status":"cached","input_hash":input_hash}));
-            self.emit(
-                "node_cached",
-                json!({"node":path,"kind":n.kind,"input_hash":input_hash}),
-            );
+            if self.config.on_event.is_some() {
+                self.emit(
+                    "node_cached",
+                    json!({"node":path,"kind":n.kind,"input_hash":input_hash}),
+                );
+            }
             return Ok(());
         }
         span.cache_miss_reason = Some(reason.clone());
@@ -1413,7 +1683,8 @@ impl GraphRunner {
             json!(efficiency),
         );
         let telemetry_summary = {
-            let run = lock(&self.last_telemetry);
+            let mut completed = lock(&self.last_telemetry);
+            let run = completed.summary();
             json!({"run_id":run.run_id,"wall_time_ms":run.wall_time_ms,"total_work_ms":run.total_work_ms,
                    "parallelism_factor":run.parallelism_factor,"critical_path":run.critical_path,
                    "cache_hit_rate_pct":run.cache_hit_rate_pct,"total_tokens":run.total_tokens,"total_cost_usd":run.total_cost_usd})
@@ -2247,6 +2518,69 @@ mod tests {
                 assert_eq!(v["workflow_ref"], "fixture");
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_reuses_merged_disk_state_and_recovers_from_external_changes() {
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path());
+        let runner = GraphRunner::new(cfg.clone()).unwrap();
+        runner
+            .record("local", json!({"status":"running"}), false)
+            .unwrap();
+        let peer_state = json!({"version":3,"nodes":{"peer":{"status":"passed"}},"label":"peer"});
+        files::write_json(&cfg.state_path, &peer_state, true).unwrap();
+        runner
+            .record("local", json!({"status":"passed"}), true)
+            .unwrap();
+        runner
+            .record("next", json!({"status":"passed"}), true)
+            .unwrap();
+        let merged = read_state(&cfg.state_path).unwrap();
+        assert_eq!(merged.extra["label"], "peer");
+        assert_eq!(merged.nodes["peer"]["status"], "passed");
+        assert!(!runner.state().nodes.contains_key("peer"));
+
+        files::write_text(&cfg.state_path, "{").unwrap();
+        assert!(runner
+            .record("broken", json!({"status":"passed"}), true)
+            .is_err());
+        assert!(!runner.state().nodes.contains_key("broken"));
+        assert_eq!(runner.trace().len(), 2);
+        fs::remove_file(&cfg.state_path).unwrap();
+        runner
+            .record("last", json!({"status":"passed"}), true)
+            .unwrap();
+        assert_eq!(
+            read_state(&cfg.state_path).unwrap().nodes,
+            runner.state().nodes
+        );
+    }
+
+    #[test]
+    fn reads_linked_worktree_head_from_common_loose_or_packed_refs() {
+        let repo = tempdir().unwrap();
+        let root = repo.path();
+        let marker = root.join(".git");
+        let dir = root.join("common/worktrees/linked");
+        let common = root.join("common");
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(common.join("refs/heads")).unwrap();
+        fs::write(&marker, "gitdir: common/worktrees/linked\n").unwrap();
+        fs::write(dir.join("commondir"), "../..\n").unwrap();
+        fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(common.join("refs/heads/main"), oid).unwrap();
+        assert_eq!(read_git_head(&marker).as_deref(), Some(oid));
+        fs::remove_file(common.join("refs/heads/main")).unwrap();
+        fs::write(
+            common.join("packed-refs"),
+            format!("# pack-refs\n{oid} refs/heads/main\n"),
+        )
+        .unwrap();
+        assert_eq!(read_git_head(&marker).as_deref(), Some(oid));
+        fs::write(dir.join("HEAD"), oid).unwrap();
+        assert_eq!(read_git_head(&marker).as_deref(), Some(oid));
     }
 
     #[test]

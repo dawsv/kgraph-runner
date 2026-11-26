@@ -1,10 +1,12 @@
 //! Strict binary media validation and PNG alpha-coverage measurements.
 
 use crate::types::VerifyOutcome;
-use flate2::{Crc, Decompress, FlushDecompress, Status};
+#[cfg(test)]
+use flate2::Crc;
+use flate2::{Decompress, FlushDecompress, Status};
 use png::ColorType;
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::Path};
+use std::{cell::RefCell, ffi::c_void, fs, io::Read, path::Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PngBBox {
@@ -65,39 +67,148 @@ fn png_chunk<'a>(input: &mut &'a [u8]) -> Result<(&'a [u8], &'a [u8]), String> {
     let kind = &header[4..];
     let (payload, rest) = split_at(&input[8..], length).ok_or("Truncated PNG chunk")?;
     let (checksum, next) = split_at(rest, 4).ok_or("Truncated PNG chunk CRC")?;
-    let mut crc = Crc::new();
-    crc.update(kind);
-    crc.update(payload);
-    if crc.sum().to_be_bytes() != checksum {
+    // SAFETY: `kind` and `payload` are valid slices; `libdeflate_crc32` only reads within their lengths.
+    let crc = unsafe {
+        let c = libdeflate_sys::libdeflate_crc32(0, kind.as_ptr().cast::<c_void>(), kind.len());
+        libdeflate_sys::libdeflate_crc32(c, payload.as_ptr().cast::<c_void>(), payload.len())
+    };
+    if crc.to_be_bytes() != checksum {
         return Err(format!("Bad CRC in {} chunk", format_bytes_repr(kind)));
     }
     *input = next;
     Ok((kind, payload))
 }
 
+enum Idat<'a> {
+    Empty,
+    Single(&'a [u8]),
+    Multi(Vec<u8>),
+}
+
+impl<'a> Idat<'a> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(bytes) => bytes,
+            Self::Multi(bytes) => bytes,
+        }
+    }
+
+    fn append(&mut self, payload: &'a [u8]) -> Result<(), String> {
+        if payload.len() > MAX_IDAT_BYTES - self.bytes().len() {
+            return Err("PNG exceeds IDAT byte limit".into());
+        }
+        if !payload.is_empty() {
+            match self {
+                Self::Empty => *self = Self::Single(payload),
+                Self::Single(first) => *self = Self::Multi([*first, payload].concat()),
+                Self::Multi(bytes) => bytes.extend_from_slice(payload),
+            }
+        }
+        Ok(())
+    }
+}
+
+struct LibdeflateGuard(*mut libdeflate_sys::libdeflate_decompressor);
+
+impl Drop for LibdeflateGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: pointer was allocated by `libdeflate_alloc_decompressor`.
+            unsafe { libdeflate_sys::libdeflate_free_decompressor(self.0) };
+        }
+    }
+}
+
+thread_local! {
+    static LIBDEFLATE: RefCell<LibdeflateGuard> = RefCell::new(LibdeflateGuard(
+        // SAFETY: allocates a reusable thread-local decompressor handle.
+        unsafe { libdeflate_sys::libdeflate_alloc_decompressor() }
+    ));
+}
+
+// Fast SIMD zlib inflate via libdeflate when the stream matches the exact
+// expected input and output sizes; falls back to flate2 for exact error parity.
+fn scanlines(compressed: &[u8], size: usize) -> Result<Vec<u8>, String> {
+    if !compressed.is_empty() && size > 0 {
+        let mut raw: Vec<u8> = Vec::with_capacity(size);
+        let fast_ok = LIBDEFLATE.with(|cell| {
+            let guard = cell.borrow_mut();
+            if guard.0.is_null() {
+                return false;
+            }
+            let mut actual_in = 0usize;
+            let mut actual_out = 0usize;
+            // SAFETY: `compressed` is readable for `compressed.len()` bytes and `raw` has
+            // capacity `size`; `raw.set_len(size)` is only called when `libdeflate` reports
+            // `LIBDEFLATE_SUCCESS` with `actual_out == size` (having initialized all `size` bytes).
+            let rc = unsafe {
+                libdeflate_sys::libdeflate_zlib_decompress_ex(
+                    guard.0,
+                    compressed.as_ptr().cast::<c_void>(),
+                    compressed.len(),
+                    raw.as_mut_ptr().cast::<c_void>(),
+                    size,
+                    &mut actual_in,
+                    &mut actual_out,
+                )
+            };
+            if rc == libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS
+                && actual_in == compressed.len()
+                && actual_out == size
+            {
+                unsafe { raw.set_len(size) };
+                true
+            } else {
+                false
+            }
+        });
+        if fast_ok {
+            return Ok(raw);
+        }
+    }
+    scanlines_fallback(compressed, size)
+}
+
 // The png crate accepts extra compressed bytes after the image. Require the
 // zlib stream end, checksum, entire input, and exact declared scanline length.
-fn scanlines(compressed: &[u8], size: usize) -> Result<Vec<u8>, String> {
+fn scanlines_fallback(compressed: &[u8], size: usize) -> Result<Vec<u8>, String> {
     let mut inflater = Decompress::new(true);
-    let mut scratch = [0; 32 * 1024];
-    let mut raw = Vec::new();
+    let mut raw = Vec::with_capacity(size);
     loop {
         let offset = inflater.total_in() as usize;
-        let status = inflater
-            .decompress(&compressed[offset..], &mut scratch, FlushDecompress::None)
-            .map_err(|e| e.to_string())?;
-        let written = inflater.total_out() as usize - raw.len();
-        if written > size - raw.len() {
+        let written = inflater.total_out();
+        let input = &compressed[offset..];
+        // A full output buffer can leave the zlib trailer to be consumed.
+        let status = if raw.len() == size {
+            inflater.decompress(input, &mut [0; 1], FlushDecompress::None)
+        } else {
+            inflater.decompress_vec(input, &mut raw, FlushDecompress::None)
+        }
+        .map_err(|e| e.to_string())?;
+        if inflater.total_out() > size as u64 {
+            // The original decoder reported zlib errors from the entire 32 KiB
+            // block containing the overflow before reporting a dimension error.
+            let block_end = (size / 32768 + 1) * 32768;
+            let remaining = block_end - inflater.total_out() as usize;
+            if status != Status::StreamEnd && remaining > 0 {
+                inflater
+                    .decompress(
+                        &compressed[inflater.total_in() as usize..],
+                        &mut [0; 32768][..remaining],
+                        FlushDecompress::None,
+                    )
+                    .map_err(|e| e.to_string())?;
+            }
             break;
         }
-        raw.extend_from_slice(&scratch[..written]);
         if status == Status::StreamEnd {
             if raw.len() == size && inflater.total_in() as usize == compressed.len() {
                 return Ok(raw);
             }
             break;
         }
-        if written == 0 && inflater.total_in() as usize == offset {
+        if inflater.total_out() == written && inflater.total_in() as usize == offset {
             break;
         }
     }
@@ -105,10 +216,9 @@ fn scanlines(compressed: &[u8], size: usize) -> Result<Vec<u8>, String> {
 }
 
 fn paeth(left: u8, up: u8, corner: u8) -> u8 {
-    let estimate = i32::from(left) + i32::from(up) - i32::from(corner);
-    let a = (estimate - i32::from(left)).abs();
-    let b = (estimate - i32::from(up)).abs();
-    let c = (estimate - i32::from(corner)).abs();
+    let dx = i16::from(up) - i16::from(corner);
+    let dy = i16::from(left) - i16::from(corner);
+    let (a, b, c) = (dx.abs(), dy.abs(), (dx + dy).abs());
     if a <= b && a <= c {
         left
     } else if b <= c {
@@ -122,26 +232,42 @@ fn unfilter(raw: &mut [u8], stride: usize, channels: usize) -> Result<(), String
     let mut previous: &[u8] = &[];
     for scanline in raw.chunks_exact_mut(stride + 1) {
         let (&mut method, row) = scanline.split_first_mut().unwrap();
-        if method > 4 {
-            return Err(format!("Unknown PNG filter {method}"));
-        }
-        if method != 0 {
-            for i in 0..row.len() {
-                let before = i.checked_sub(channels);
-                let left = before.map_or(0, |j| row[j]);
-                let up = previous.get(i).copied().unwrap_or(0);
-                let predictor = match method {
-                    1 => left,
-                    2 => up,
-                    3 => ((u16::from(left) + u16::from(up)) / 2) as u8,
-                    _ => paeth(
-                        left,
-                        up,
-                        before.and_then(|j| previous.get(j)).copied().unwrap_or(0),
-                    ),
-                };
-                row[i] = row[i].wrapping_add(predictor);
+        match (method, previous.is_empty()) {
+            (0, _) | (2, true) => (),
+            (1, _) | (4, true) => {
+                for i in channels..stride {
+                    row[i] = row[i].wrapping_add(row[i - channels]);
+                }
             }
+            (2, false) => {
+                for (byte, &up) in row.iter_mut().zip(previous) {
+                    *byte = byte.wrapping_add(up);
+                }
+            }
+            (3, true) => {
+                for i in channels..stride {
+                    row[i] = row[i].wrapping_add(row[i - channels] / 2);
+                }
+            }
+            (3, false) => {
+                for (byte, &up) in row[..channels].iter_mut().zip(previous) {
+                    *byte = byte.wrapping_add(up / 2);
+                }
+                for i in channels..stride {
+                    let sum = u16::from(row[i - channels]) + u16::from(previous[i]);
+                    row[i] = row[i].wrapping_add((sum / 2) as u8);
+                }
+            }
+            (4, false) => {
+                for (byte, &up) in row[..channels].iter_mut().zip(previous) {
+                    *byte = byte.wrapping_add(up);
+                }
+                for i in channels..stride {
+                    let predictor = paeth(row[i - channels], previous[i], previous[i - channels]);
+                    row[i] = row[i].wrapping_add(predictor);
+                }
+            }
+            _ => return Err(format!("Unknown PNG filter {method}")),
         }
         previous = row;
     }
@@ -192,7 +318,7 @@ impl Png {
         }
         let mut palette = Vec::new();
         let mut transparency = None;
-        let mut compressed = Vec::new();
+        let mut compressed = Idat::Empty;
         let mut idat_ended = false;
         loop {
             let (kind, payload) = png_chunk(&mut input)?;
@@ -200,13 +326,10 @@ impl Png {
                 if idat_ended {
                     return Err("PNG IDAT chunks must be consecutive".into());
                 }
-                if payload.len() > MAX_IDAT_BYTES - compressed.len() {
-                    return Err("PNG exceeds IDAT byte limit".into());
-                }
-                compressed.extend_from_slice(payload);
+                compressed.append(payload)?;
                 continue;
             }
-            idat_ended |= !compressed.is_empty();
+            idat_ended |= !compressed.bytes().is_empty();
             match kind {
                 b"PLTE" => {
                     if idat_ended
@@ -257,7 +380,7 @@ impl Png {
         if color == ColorType::Indexed && palette.is_empty() {
             return Err("Indexed PNG requires a palette".into());
         }
-        let mut raw = scanlines(&compressed, size)?;
+        let mut raw = scanlines(compressed.bytes(), size)?;
         unfilter(&mut raw, stride, color.samples())?;
         let png = Self {
             width,
@@ -292,6 +415,20 @@ impl Png {
     }
 
     fn has_variation(&self) -> bool {
+        if self.color == ColorType::Rgba {
+            let mut pixels = self.rows().flat_map(|row| row.as_chunks::<4>().0);
+            let first = pixels.next().unwrap();
+            return if first[3] == 0 {
+                pixels.any(|pixel| pixel[3] != 0)
+            } else {
+                pixels.any(|pixel| pixel != first)
+            };
+        }
+        if self.color == ColorType::Rgb {
+            let mut pixels = self.rows().flat_map(|row| row.as_chunks::<3>().0);
+            let first = pixels.next().unwrap();
+            return pixels.any(|pixel| pixel != first);
+        }
         let mut pixels = self
             .rows()
             .flat_map(|row| row.chunks_exact(self.color.samples()));
@@ -314,15 +451,26 @@ impl Png {
     }
 
     fn inspect(&self) -> PngInspection {
+        match self.color {
+            ColorType::Rgba => self.inspect_alpha(4, |pixel| pixel[3]),
+            ColorType::Rgb => {
+                let key = self.transparency.as_deref();
+                self.inspect_alpha(3, |pixel| if key == Some(pixel) { 0 } else { 255 })
+            }
+            _ => self.inspect_alpha(self.color.samples(), |pixel| self.alpha(pixel)),
+        }
+    }
+
+    fn inspect_alpha(&self, channels: usize, alpha_of: impl Fn(&[u8]) -> u8) -> PngInspection {
         let (w, h) = (self.width, self.height);
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, 0, 0);
         let (mut opaque, mut transparent, mut edge_count, mut edge_clear) =
             (0u64, 0u64, 0u64, 0u64);
         for (y, row) in self.rows().enumerate() {
             let y = y as u32;
-            for (x, pixel) in row.chunks_exact(self.color.samples()).enumerate() {
+            for (x, pixel) in row.chunks_exact(channels).enumerate() {
                 let x = x as u32;
-                let alpha = self.alpha(pixel);
+                let alpha = alpha_of(pixel);
                 if x == 0 || x == w - 1 || y == 0 || y == h - 1 {
                     edge_count += 1;
                     edge_clear += u64::from(alpha <= 16);
@@ -351,7 +499,6 @@ impl Png {
         if let Some(bounds) = &bbox {
             bottom_margin_ratio = f64::from(h - max_y - 1) / f64::from(h);
             let band = (u64::from(bounds.content_height) * 3).div_ceil(10) as u32;
-            let channels = self.color.samples();
             for row in self
                 .rows()
                 .skip((max_y + 1 - band) as usize)
@@ -360,7 +507,7 @@ impl Png {
                 soft_shadow_pixels += row
                     [min_x as usize * channels..(max_x as usize + 1) * channels]
                     .chunks_exact(channels)
-                    .filter(|p| (10..=200).contains(&self.alpha(p)))
+                    .filter(|p| (10..=200).contains(&alpha_of(p)))
                     .count();
             }
         }
@@ -758,6 +905,42 @@ mod tests {
                 pixels
             );
         }
+    }
+
+    #[test]
+    fn consecutive_idat_chunks_decode_across_every_zlib_boundary() {
+        let raw = [0, 1, 2, 3, 0, 0, 4, 5, 6, 255];
+        let z = compressed(&raw);
+        let ihdr = chunk(b"IHDR", &header(1, 2, ColorType::Rgba));
+        let iend = chunk(b"IEND", &[]);
+        for split in 0..=z.len() {
+            let data = [
+                SIGNATURE,
+                &ihdr,
+                &chunk(b"IDAT", &z[..split]),
+                &chunk(b"IDAT", &[]),
+                &chunk(b"IDAT", &z[split..]),
+                &iend,
+            ]
+            .concat();
+            let image = Png::decode(&data).unwrap();
+            assert_eq!(image.raw, raw);
+            assert!(image.has_variation());
+        }
+    }
+
+    #[test]
+    fn zlib_checksum_error_precedes_dimension_error_within_the_overflow_block() {
+        let invalid = |n| {
+            let mut bytes = compressed(&vec![0; n]);
+            *bytes.last_mut().unwrap() ^= 1;
+            bytes
+        };
+        let checksum_error = scanlines(&invalid(32), 32).unwrap_err();
+        let dimensions_error = "PNG scanline data does not match the dimensions";
+        assert_ne!(checksum_error, dimensions_error);
+        assert_eq!(scanlines(&invalid(32), 3).unwrap_err(), checksum_error);
+        assert_eq!(scanlines(&invalid(32769), 3).unwrap_err(), dimensions_error);
     }
 
     #[test]

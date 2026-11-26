@@ -20,12 +20,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn state_path(args: &Execution) -> PathBuf {
+    args.state
+        .clone()
+        .unwrap_or_else(|| default_file(&args.workflow, "_state.json"))
+}
+
 fn config(args: &Execution) -> RunnerConfig {
     RunnerConfig {
-        state_path: args
-            .state
-            .clone()
-            .unwrap_or_else(|| default_file(&args.workflow, "_state.json")),
+        state_path: state_path(args),
         retry_nodes: args.retry.iter().cloned().collect(),
         until: args.until.clone(),
         force: args.force,
@@ -239,6 +242,10 @@ fn once(
     previous: usize,
 ) -> Result<Iteration> {
     let began = chrono::Utc::now();
+    let dirty_probe = paths
+        .telemetry
+        .as_ref()
+        .and_then(|_| kgraph_core::engine::spawn_git_dirty_probe());
     let started = paths.register("running", None);
     let expected = started.as_ref().and_then(|v| v["updated_at"].as_str());
     if let (Some(hub), Some(id)) = (hub, started.as_ref().and_then(|v| v["id"].as_str())) {
@@ -300,23 +307,30 @@ fn once(
     }
     let flow = loaded.as_ref().ok().map(Arc::as_ref);
     let status = result.status(&runner);
-    // Append here so the workflow reference never overrides a user's workflow context.
-    // This also records load failures which do not reach GraphRunner::run.
-    if let Some(path) = &paths.telemetry {
-        let reference = paths.workflow.to_string_lossy();
-        let mut run = runner.build_run_telemetry(status, result.code, Some(&reference));
-        if run.run_id.is_empty() {
-            let end = chrono::Utc::now();
-            run.started_at = began.to_rfc3339();
-            run.finished_at = end.to_rfc3339();
-            run.run_id = format!("{}-{}", run.started_at, std::process::id());
-            run.wall_time_ms = (end - began).num_microseconds().unwrap_or(0) as f64 / 1000.0;
-            run.state_path = paths.state.display().to_string();
+    let record_telemetry = |dirty_probe: Option<std::thread::JoinHandle<Option<bool>>>| {
+        if let Some(path) = &paths.telemetry {
+            let precomputed = dirty_probe.and_then(|h| h.join().ok());
+            let reference = paths.workflow.to_string_lossy();
+            let mut run = runner.build_run_telemetry_with_git_dirty(
+                status,
+                result.code,
+                Some(&reference),
+                precomputed,
+            );
+            if run.run_id.is_empty() {
+                let end = chrono::Utc::now();
+                run.started_at = began.to_rfc3339();
+                run.finished_at = end.to_rfc3339();
+                run.run_id = format!("{}-{}", run.started_at, std::process::id());
+                run.wall_time_ms = (end - began).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+                run.state_path = paths.state.display().to_string();
+                run.git_dirty = precomputed.flatten();
+            }
+            if let Err(error) = kgraph_core::telemetry::append_run_telemetry(path, &run) {
+                eprintln!("kgraph-town: could not record telemetry: {error}");
+            }
         }
-        if let Err(error) = kgraph_core::telemetry::append_run_telemetry(path, &run) {
-            eprintln!("kgraph-town: could not record telemetry: {error}");
-        }
-    }
+    };
     if !result.error.is_empty() {
         eprintln!("kgraph-town: {status}: {}", result.error);
     }
@@ -331,6 +345,7 @@ fn once(
         );
     }
     if let Err(e) = write_report(paths, &runner, &result, flow, previous, max_workers) {
+        record_telemetry(dirty_probe);
         paths.register("failed", expected);
         if let Some(h) = hub {
             h.finish(paths.snapshot(flow, "failed", None));
@@ -338,6 +353,7 @@ fn once(
         return Err(e);
     }
     paths.register(status, expected);
+    record_telemetry(dirty_probe);
     let id = hub.and_then(|h| h.finish(paths.snapshot(flow, status, None)));
     if !args.quiet {
         println!("{status} | report: {}", paths.report.display());
@@ -374,7 +390,7 @@ fn same_file_identity(a: &Path, b: &Path) -> bool {
 
 pub fn run(args: Run) -> Result<i32> {
     let workflow = resolve(&args.execution.workflow)?;
-    let state = config(&args.execution).state_path;
+    let state = state_path(&args.execution);
     let report = args
         .report
         .clone()

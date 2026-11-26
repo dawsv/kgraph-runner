@@ -122,7 +122,10 @@ fn validate_preset_commands(config: &Map<String, Value>) -> Result<(), String> {
 }
 
 fn interpolate(s: &str, ctx: &Context, item: Option<&Value>) -> Result<String, String> {
-    let mut result = String::new();
+    if !s.contains("{{") {
+        return Ok(s.to_owned());
+    }
+    let mut result = String::with_capacity(s.len());
     let mut last = 0;
     for m in TEMPLATE.captures_iter(s) {
         let full = m.get(0).unwrap();
@@ -314,16 +317,28 @@ impl Spec<'_> {
     }
 
     fn hash(&self, exclude: Vec<PathBuf>) -> Result<InputHashFn, String> {
-        let spec_hash = fingerprint(self.value.clone());
-        let base = self.base.to_owned();
+        let spec_hash = kgraph_core::hash::sha256_json(self.value);
         let globs = self.strings("watch_globs")?;
         let paths = self.paths("watch_paths")?;
+        if globs.is_empty() && paths.is_empty() {
+            const EMPTY_SHA256: &str =
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+            let static_hash = fingerprint(json!([spec_hash, EMPTY_SHA256, EMPTY_SHA256]));
+            return Ok(Arc::new(move |_| Ok(static_hash.clone())));
+        }
+        let base = self.base.to_owned();
         Ok(Arc::new(move |_| {
-            Ok(fingerprint(json!([
-                spec_hash,
-                hash_globs(&globs, Some(&base), None, &exclude, true)?,
+            let globs_hash = if globs.is_empty() {
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()
+            } else {
+                hash_globs(&globs, Some(&base), None, &exclude, true)?
+            };
+            let paths_hash = if paths.is_empty() {
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned()
+            } else {
                 hash_paths(&paths, Some(&base), None, &exclude, true)?
-            ])))
+            };
+            Ok(fingerprint(json!([spec_hash, globs_hash, paths_hash])))
         }))
     }
 

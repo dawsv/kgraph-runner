@@ -21,6 +21,48 @@ static CREDENTIAL: Lazy<Regex> = Lazy::new(|| {
 static CLASS_DIFFERENCES: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"[\x1c-\x1fİı]|[\w&&[^\p{L}\p{N}_]]").unwrap());
 
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+// Fast conservative prefilter: avoids compiling/running the heavy Unicode regexes
+// on ordinary ASCII text that cannot match any branch of CREDENTIAL.
+fn may_contain_credential(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    if bytes.iter().any(|&b| !b.is_ascii()) {
+        return true;
+    }
+    let has_eq_or_colon = bytes.iter().any(|&b| b == b'=' || b == b':');
+    if has_eq_or_colon
+        && (bytes.contains(&b'@')
+            || contains_ascii_ci(bytes, b"token")
+            || contains_ascii_ci(bytes, b"pass")
+            || contains_ascii_ci(bytes, b"secret")
+            || contains_ascii_ci(bytes, b"key")
+            || contains_ascii_ci(bytes, b"credential"))
+    {
+        return true;
+    }
+    bytes.windows(2).any(|w| w == b"--")
+        || contains_ascii_ci(bytes, b"bearer")
+        || contains_ascii_ci(bytes, b"basic")
+        || contains_ascii_ci(bytes, b"aiza")
+        || contains_ascii_ci(bytes, b"akia")
+        || contains_ascii_ci(bytes, b"asia")
+        || contains_ascii_ci(bytes, b"sk-")
+        || contains_ascii_ci(bytes, b"npm_")
+        || contains_ascii_ci(bytes, b"xox")
+        || contains_ascii_ci(bytes, b"ghp_")
+        || contains_ascii_ci(bytes, b"gho_")
+        || contains_ascii_ci(bytes, b"ghu_")
+        || contains_ascii_ci(bytes, b"ghs_")
+        || contains_ascii_ci(bytes, b"ghr_")
+        || contains_ascii_ci(bytes, b"github_pat_")
+}
+
 struct Matcher<'a> {
     text: std::borrow::Cow<'a, str>,
     offsets: Vec<usize>,
@@ -28,7 +70,10 @@ struct Matcher<'a> {
 
 impl<'a> Matcher<'a> {
     fn new(input: &'a str) -> Self {
-        if !CLASS_DIFFERENCES.is_match(input) {
+        let needs_projection = input
+            .bytes()
+            .any(|b| !b.is_ascii() || (0x1c..=0x1f).contains(&b));
+        if !needs_projection || !CLASS_DIFFERENCES.is_match(input) {
             return Self {
                 text: input.into(),
                 offsets: Vec::new(),
@@ -67,6 +112,9 @@ impl<'a> Matcher<'a> {
 }
 
 fn redact_from(input: &str, cutoff: usize) -> String {
+    if !may_contain_credential(input) {
+        return input[cutoff..].to_owned();
+    }
     let matcher = Matcher::new(input);
     let mut result = String::new();
     let mut cursor = cutoff;
@@ -88,7 +136,7 @@ pub fn redact_credentials(text: &str) -> String {
 }
 
 pub fn has_credentials(text: &str) -> bool {
-    CREDENTIAL.is_match(&Matcher::new(text).text)
+    may_contain_credential(text) && CREDENTIAL.is_match(&Matcher::new(text).text)
 }
 
 /// Cut at a UTF-8 byte offset in the original window. When a match crosses
