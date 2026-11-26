@@ -375,17 +375,19 @@ fn once(
 
 // Callers resolve both paths first so aliases also compare equal before creation.
 fn same_file_identity(a: &Path, b: &Path) -> bool {
-    if a == b {
-        return true;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let (Ok(left), Ok(right)) = (a.metadata(), b.metadata()) {
-            return left.dev() == right.dev() && left.ino() == right.ino();
-        }
+        a == b
+            || matches!(
+                (a.metadata(), b.metadata()),
+                (Ok(left), Ok(right)) if left.dev() == right.dev() && left.ino() == right.ino()
+            )
     }
-    false
+    #[cfg(not(unix))]
+    {
+        a == b
+    }
 }
 
 pub fn run(args: Run) -> Result<i32> {
