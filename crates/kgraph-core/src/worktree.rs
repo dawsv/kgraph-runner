@@ -389,12 +389,32 @@ impl IsolatedWorktree {
                 ])
                 .stdout(Stdio::from(tmp.reopen().map_err(|e| e.to_string())?));
             run(&mut patch)?;
-            captured = Some(if let Some(out) = patch_out {
+            captured = if let Some(out) = patch_out {
                 patch_path = Some(out.into());
-                tmp.persist(out).map_err(|e| e.to_string())?
+                let persisted = tmp.persist(out).map_err(|e| e.to_string())?;
+                if !for_patch_merge {
+                    drop(persisted);
+                    None
+                } else {
+                    #[cfg(unix)]
+                    {
+                        Some(persisted)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        // Windows refuses to rename over an open file; keep a private copy for merge.
+                        use std::io::{Seek, SeekFrom};
+                        let mut src = persisted;
+                        src.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                        let mut copy = tempfile::tempfile().map_err(|e| e.to_string())?;
+                        std::io::copy(&mut src, &mut copy).map_err(|e| e.to_string())?;
+                        copy.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+                        Some(copy)
+                    }
+                }
             } else {
-                tmp.into_file()
-            });
+                Some(tmp.into_file())
+            };
         }
         Ok((
             WorktreeResult {
