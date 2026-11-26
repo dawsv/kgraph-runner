@@ -1,17 +1,25 @@
 """Build a serializable view of workflow topology and persisted run telemetry."""
 
 from collections import defaultdict
+from contextlib import contextmanager, suppress
+from copy import deepcopy
 from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_file_location
 import json
 from pathlib import Path
 import re
+import sys
+from threading import Lock
+from typing import Callable
 
 from .interactions import (
     _ACTIVE_SUBTASK_PARENTS, _CREDENTIAL, _PACKET_LIMIT, _TASK_KINDS,
-    _match_report_node, _read_json, _reject_constant, _report_segments, _resolve_packet, _wave_edges,
-    build_node_sub_graph, extract_input_gate, read_node_progress,
+    _match_report_node, _output_path, _read_json, _reject_constant,
+    _report_segments, _resolve_packet, _wave_edges, build_node_sub_graph, extract_input_gate,
+    progress_path_for_state, read_node_progress, validate_kgraph_output_path,
 )
-from .workflow import _load_workflow, _require_object, _resolve_context, _resolve_graph
+from .workflow import _load_workflow, _require_object, _resolve_context, _resolve_graph, _workflow_lock
 
 
 _CONTAINERS = {"subgraph", "loop_subgraph", "splitter"}
@@ -68,11 +76,20 @@ def _attention_text(value, limit=200):
     return value or None
 
 
-def _read_attention_packet(value, *, state_file, report_file, project_dir):
+def _attention_packet_path(value, *, state_file, report_file, project_dir, watch):
     if state_file is None or report_file is None:
+        return None
+    try:
+        return _resolve_packet(value, state_file.resolve(), report_file.resolve(), project_dir, watch=watch)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _read_attention_packet(value, **paths):
+    path = _attention_packet_path(value, **paths)
+    if path is None:
         return None, {}
     try:
-        path = _resolve_packet(value, state_file.resolve(), report_file.resolve(), project_dir)
         return str(path), _read_json(path, limit=_PACKET_LIMIT)[0]
     except (OSError, ValueError, RuntimeError):
         return None, {}
@@ -121,24 +138,36 @@ def _subtask_attention(nodes):
             "input_gate": gate, "items": _question_previews(gate), "packet_path": None}
 
 
-def _build_attention(status, nodes, report, use_report, *, state_file, report_file, project_dir):
+def _build_attention(status, nodes, report, use_report, *, state_file, report_file, project_dir, watch=None):
+    paths = dict(state_file=state_file, report_file=report_file, project_dir=project_dir, watch=watch)
+    packet_paths = {}
+    if use_report:
+        for raw in _array(report.get("packet_paths")):
+            path = _attention_packet_path(raw, **paths)
+            if path is not None and _attention_text(str(path)):
+                packet_paths.setdefault(path.resolve(), str(path))
+
+    def with_packet_paths(attention):
+        if len(packet_paths) > 1 and attention is not None:
+            attention["packet_paths"] = list(packet_paths.values())
+        return attention
+
     kind = _ATTENTION_KINDS.get(status)
     if kind in (None, "done"):
         if attention := _subtask_attention(nodes):
-            return attention
+            return with_packet_paths(attention)
         if kind is None:
             return None
         if _attention_candidates(nodes, None):
             return None
-        return {"kind": "done", "headline": "Workflow complete", "detail": None,
-                "node_path": None, "items": [], "packet_path": None}
+        return with_packet_paths({"kind": "done", "headline": "Workflow complete", "detail": None,
+                                  "node_path": None, "items": [], "packet_path": None})
 
     error = report.get("error") if use_report else None
     segments = _report_segments(report) if use_report else []
     packet_path, packet = (None, {})
     if use_report and kind in ("waiting", "decision", "stuck"):
-        packet_path, packet = _read_attention_packet(report.get("packet_path"), state_file=state_file,
-                                                     report_file=report_file, project_dir=project_dir)
+        packet_path, packet = _read_attention_packet(report.get("packet_path"), **paths)
     stage = _attention_text(packet.get("stage"), 80)
     bug = _attention_text(packet.get("bug_id"), 80)
     candidates = _attention_candidates(nodes, kind)
@@ -173,11 +202,17 @@ def _build_attention(status, nodes, report, use_report, *, state_file, report_fi
         approval = outputs[0] if outputs else None
     input_gate = None
     if packet and kind in ("waiting", "decision"):
+        if watch is not None:
+            try:
+                watch(validate_kgraph_output_path(_output_path(packet), state_path=state_file,
+                                                  packet_path=packet_path, project_dir=project_dir))
+            except (OSError, ValueError, RuntimeError):
+                pass
         input_gate = extract_input_gate(packet, packet_path, node_path=node.get("path"), state_path=state_file,
                                         project_dir=project_dir, allow_respond=state_file is not None)
     if input_gate is None:
         if attention := _subtask_attention(nodes):
-            return attention
+            return with_packet_paths(attention)
     if kind == "waiting" and (input_gate or review_gate or approval or packet.get("approved_fields")):
         kind = "decision"
     review = _attention_text(packet.get("review_summary_path") or packet.get("review_summary"), 160)
@@ -194,7 +229,7 @@ def _build_attention(status, nodes, report, use_report, *, state_file, report_fi
         attention["input_gate"] = input_gate
         if not items:
             items.extend(_question_previews(input_gate))
-    return attention
+    return with_packet_paths(attention)
 
 
 def _cached_paths(report, records):
@@ -293,6 +328,10 @@ def _split_branches(node, ctx, path, warnings, child_types):
     return children
 
 
+def _redact_detail(detail):
+    return _CREDENTIAL.sub("[redacted]", detail) if isinstance(detail, str) else detail
+
+
 class _SnapshotTree:
     def __init__(self, records, report, ctx, warnings, node_types, progress, state_file):
         self.records = records
@@ -343,7 +382,7 @@ class _SnapshotTree:
         if node_type in _CONTAINERS:
             branches = getattr(defined, "nodes", ())
             if node_type == "splitter" and defined is not None:
-                child_types = tuple(cls for cls, name in self.node_types if name != "splitter")
+                child_types = tuple(cls for cls, _ in self.node_types)
                 branches = _split_branches(defined, self.ctx, path, self.warnings, child_types)
             children, edges = self.level(
                 branches, path, include_recorded=include_recorded or node_type == "splitter",
@@ -378,6 +417,7 @@ class _SnapshotTree:
             "max_retries": max_retries,
             "timeout_s": getattr(defined, "timeout_s", record.get("timeout_s")),
             "cacheable": getattr(defined, "cacheable", record.get("cacheable")),
+            "cache_miss_reason": record.get("cache_miss_reason"),
             "max_workers": getattr(defined, "max_workers", record.get("max_workers")),
             "status": status,
             "attempts": record.get("attempts", 0),
@@ -386,7 +426,7 @@ class _SnapshotTree:
             "outputs": _array(record.get("outputs")),
             "output_hashes": _object(record.get("output_hashes")),
             "error_signature": record.get("error_signature"),
-            "detail": record.get("detail"),
+            "detail": _redact_detail(record.get("detail")),
             "started_at": record.get("started_at"),
             "updated_at": timestamp,
             "children": children,
@@ -414,8 +454,105 @@ def build_town_snapshot(workflow_path=None, state_path=None, report_path=None,
                                     definition=(_resolve_graph(module, factory, ctx), ctx))
 
 
+def _file_signature(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+@contextmanager
+def _cached_workflow_scope(module):
+    # Keep the import environment used by one-shot snapshots for factories and
+    # splitter callbacks that import local helpers when called.
+    name, parent = module.__name__, str(Path(module.__file__).parent)
+    with _workflow_lock:
+        previous = sys.modules.get(name)
+        inserted = parent not in sys.path
+        if inserted:
+            sys.path.insert(0, parent)
+        sys.modules[name] = module
+        try:
+            yield
+        finally:
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+            if inserted:
+                with suppress(ValueError):
+                    sys.path.remove(parent)
+
+
+class _SnapshotSourceLoader(SourceFileLoader):
+    def get_code(self, fullname):
+        # Timestamp-based .pyc validation misses same-size edits in the same second.
+        return self.source_to_code(self.get_data(self.path), self.path)
+
+
+def cached_town_snapshot(workflow_path=None, state_path=None, report_path=None, *, factory="build_graph",
+                         ctx_inline=None, ctx_file=None, title=None) -> Callable[[], dict]:
+    """Return a thread-safe snapshot provider for repeatedly served run telemetry."""
+    if workflow_path is None and state_path is None:
+        raise ValueError("Provide a workflow or a state file")
+    workflow_ref = Path(workflow_path) if workflow_path is not None else None
+    context_ref = Path(ctx_file) if ctx_file is not None else None
+    state = Path(state_path) if state_path is not None else None
+    report = Path(report_path) if report_path is not None else None
+    telemetry_paths = tuple(path for path in (state, report, progress_path_for_state(state) if state else None)
+                            if path is not None)
+    lock = Lock()
+    module_key = module = definition_key = definition = snapshot = snapshot_key = None
+    packet_files = {}
+
+    def current():
+        nonlocal module_key, module, definition_key, definition, snapshot, snapshot_key, packet_files
+        with lock:
+            workflow = workflow_ref.resolve() if workflow_ref is not None else None
+            context = context_ref.resolve() if context_ref is not None else None
+            workflow_key = (workflow, _file_signature(workflow)) if workflow is not None else None
+            context_key = (context, _file_signature(context)) if context is not None and workflow is not None else None
+            graph_key = workflow_key, context_key
+            key = graph_key, tuple(_file_signature(path) for path in telemetry_paths)
+            if key == snapshot_key and all(_file_signature(path) == stamp for path, stamp in packet_files.items()):
+                return deepcopy(snapshot)
+
+            watched = {}
+
+            def watch(path):
+                if path not in watched:
+                    watched[path] = _file_signature(path)
+
+            if workflow is None:
+                built = _snapshot_from_graph(None, state, report, title=title, watch=watch)
+            else:
+                if workflow_key != module_key:
+                    name = "_kgraph_user_workflow"
+                    spec = spec_from_file_location(name, workflow)
+                    if spec is None or spec.loader is None:
+                        raise ValueError(f"Cannot load Python workflow {workflow}")
+                    if isinstance(spec.loader, SourceFileLoader):
+                        spec.loader = _SnapshotSourceLoader(name, str(workflow))
+                    loaded = module_from_spec(spec)
+                    with _cached_workflow_scope(loaded):
+                        spec.loader.exec_module(loaded)
+                    module, module_key = loaded, workflow_key
+                    definition_key = None
+                with _cached_workflow_scope(module):
+                    if graph_key != definition_key:
+                        ctx = _resolve_context(module, ctx_inline, context)
+                        definition = (tuple(_resolve_graph(module, factory, ctx)), ctx)
+                        definition_key = graph_key
+                    built = _snapshot_from_graph(workflow, state, report, title=title, definition=definition, watch=watch)
+            snapshot, snapshot_key, packet_files = built, key, watched
+            return deepcopy(snapshot)
+
+    return current
+
+
 def _snapshot_from_graph(workflow, state_path, report_path, *, title=None, definition=None,
-                         status_override=None, project_dir=None):
+                         status_override=None, project_dir=None, watch=None):
     state_file = Path(state_path) if state_path is not None else None
     report_file = Path(report_path) if report_path is not None else None
     warnings = []
@@ -451,6 +588,10 @@ def _snapshot_from_graph(workflow, state_path, report_path, *, title=None, defin
         workflow_ref = None
     project = Path(project_dir) if project_dir is not None else Path(workflow_ref).parent if workflow_ref else None
     use_report = report.get("status") == status and latest <= tree.report_time
+    failures = [
+        {**item, "detail": _redact_detail(item["detail"])} if isinstance(item, dict) and "detail" in item else item
+        for item in _array(report.get("failure_signatures"))
+    ]
     return {
         "version": 1,
         "title": title or (Path(workflow_ref).stem if isinstance(workflow_ref, str) else state_file.stem),
@@ -459,10 +600,10 @@ def _snapshot_from_graph(workflow, state_path, report_path, *, title=None, defin
         "nodes": nodes,
         "edges": edges,
         "attention": _build_attention(status, nodes, report, use_report, state_file=state_file,
-                                      report_file=report_file, project_dir=project),
+                                      report_file=report_file, project_dir=project, watch=watch),
         "summary": _object(report.get("summary")),
         "scope": _object(report.get("scope")),
-        "failure_signatures": _array(report.get("failure_signatures")),
+        "failure_signatures": failures,
         "slowest_nodes": _array(report.get("slowest_nodes")),
         "evolution_hints": _array(report.get("evolution_hints")),
         "workflow_ref": workflow_ref,

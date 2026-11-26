@@ -1,10 +1,16 @@
 """Regression tests for the portable workflow helpers."""
 
 import json
+import os
+import shlex
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from kgraph_runner import (
     DEFAULT_IGNORE_DIRS,
@@ -15,6 +21,7 @@ from kgraph_runner import (
     shell_task,
     subagent_gate,
 )
+from kgraph_runner.helpers import clear_hash_cache
 
 
 class HelperTests(unittest.TestCase):
@@ -66,6 +73,61 @@ class HelperTests(unittest.TestCase):
         self.assertNotEqual(after, before)
         source.rename(source.with_name("two.py"))
         self.assertNotEqual(hash_paths(["src"], root=self.root), after)
+
+    def test_hash_cache_reuses_old_files_and_invalidates_on_stat_change(self):
+        clear_hash_cache()
+        self.addCleanup(clear_hash_cache)
+        source = self.write_file("source.py", "first")
+        older = time.time_ns() - 10_000_000_000
+        os.utime(source, ns=(older, older))
+        original = hash_paths([source], root=self.root)
+
+        with patch.object(Path, "open", side_effect=AssertionError("Cache hit should skip opening the file")):
+            self.assertEqual(hash_globs(["*.py"], root=self.root), original)
+
+        with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+            self.assertEqual(hash_globs(["*.py"], root=self.root, use_cache=False), original)
+            opened.assert_called_once_with(source, "rb")
+
+        source.write_text("other", encoding="utf-8")
+        changed = older + 1_000_000_000
+        os.utime(source, ns=(changed, changed))
+        updated = hash_paths([source], root=self.root)
+        self.assertNotEqual(updated, original)
+
+        clear_hash_cache()
+        with patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
+            self.assertEqual(hash_paths([source], root=self.root), updated)
+            opened.assert_called_once_with(source, "rb")
+
+    def test_hash_cache_bypasses_recent_files_with_identical_stat(self):
+        clear_hash_cache()
+        self.addCleanup(clear_hash_cache)
+        source = self.write_file("source.py", "first")
+        recent = source.stat().st_mtime_ns
+        with patch("kgraph_runner.helpers.time.time_ns", return_value=recent + 500_000_000):
+            original = hash_paths([source], root=self.root)
+            source.write_text("other", encoding="utf-8")
+            os.utime(source, ns=(recent, recent))
+            self.assertEqual(source.stat().st_mtime_ns, recent)
+            self.assertNotEqual(hash_paths([source], root=self.root), original)
+
+    @unittest.skipUnless(os.name == "posix", "Requires a POSIX change timestamp")
+    def test_hash_cache_invalidates_same_size_in_place_change_with_preserved_mtime(self):
+        clear_hash_cache()
+        self.addCleanup(clear_hash_cache)
+        source = self.write_file("source.py", "first")
+        older = time.time_ns() - 10_000_000_000
+        os.utime(source, ns=(older, older))
+        before = source.stat()
+        original = hash_paths([source], root=self.root)
+
+        source.write_text("other", encoding="utf-8")
+        os.utime(source, ns=(older, older))
+        after = source.stat()
+        self.assertEqual((before.st_ino, before.st_size, before.st_mtime_ns),
+                         (after.st_ino, after.st_size, after.st_mtime_ns))
+        self.assertNotEqual(hash_paths([source], root=self.root), original)
 
     def test_hash_globs_matches_overlapping_patterns_and_ignores_directories(self):
         source = self.write_file("pkg/source.py", "source")
@@ -125,6 +187,62 @@ class HelperTests(unittest.TestCase):
         runner.run([task], {"expected": "ready"})
         self.assertEqual(runner.state["nodes"]["verify"]["detail"], "Output verified")
 
+    def test_shell_task_runs_callable_commands(self):
+        for command in ([sys.executable, "-c", "print('ready')"], "echo ready"):
+            with self.subTest(command=command):
+                received = []
+
+                def verify(_ctx, result):
+                    received.append(result)
+                    return True, "", "Verified"
+
+                task = shell_task("dynamic", lambda ctx: ctx["command"], input_hash_fn=lambda _ctx: "input",
+                                  verify_fn=verify, cacheable=False)
+                self.runner().run([task], {"command": command})
+                self.assertIsInstance(received[0], subprocess.CompletedProcess)
+                self.assertEqual((received[0].args, received[0].stdout, received[0].stderr), (command, "ready\n", ""))
+
+    def test_shell_task_streams_both_pipes_before_exit(self):
+        log = self.root / "live.log"
+        release = self.root / "release"
+        command = [sys.executable, "-c", (
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "os.write(2, b'error\\r\\n')\n"
+            "os.write(1, b'first\\r\\n')\n"
+            "while not Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+            "os.write(1, b'last\\xff\\r')\n"
+        ), str(release)]
+        received = []
+
+        def verify(_ctx, result):
+            received.append(result)
+            return True, "", "Verified"
+
+        task = shell_task("stream", command, input_hash_fn=lambda _ctx: "input", log_path=log,
+                          timeout_s=10, verify_fn=verify)
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            running = workers.submit(self.runner().run, [task], {})
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    output = log.read_text(encoding="utf-8") if log.exists() else ""
+                    if "first\n" in output and "error\n" in output:
+                        break
+                    self.assertFalse(running.done(), "Command exited before both streams reached the live log")
+                    self.assertLess(time.monotonic(), deadline, "Timed out waiting for the live log")
+                    time.sleep(0.01)
+                self.assertFalse(running.done())
+            finally:
+                release.touch()
+            running.result(timeout=5)
+
+        expected = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=5)
+        self.assertIsInstance(received[0], subprocess.CompletedProcess)
+        self.assertEqual(received[0].stdout, expected.stdout)
+        self.assertEqual(received[0].stderr, expected.stderr)
+        self.assertEqual(log.read_text(encoding="utf-8"), expected.stdout + expected.stderr)
+
     def test_shell_task_times_out_and_captures_partial_log(self):
         log = self.root / "timeout.log"
         task = shell_task(
@@ -139,6 +257,57 @@ class HelperTests(unittest.TestCase):
             runner.run([task], {})
         self.assertEqual(runner.state["nodes"]["slow"]["error_signature"], "timeout")
         self.assertEqual(log.read_text(encoding="utf-8"), "started\n")
+
+    @unittest.skipUnless(os.name == "posix", "Requires a POSIX shell process group")
+    def test_shell_task_timeout_kills_shell_children_and_keeps_partial_streams(self):
+        log = self.root / "timeout.log"
+        child = shlex.join([sys.executable, "-c", (
+            "import sys, time; print('started', flush=True); "
+            "print('partial error', file=sys.stderr, flush=True); time.sleep(30)"
+        )])
+        task = shell_task("slow", f"{child} & wait", input_hash_fn=lambda _ctx: "input",
+                          log_path=log, timeout_s=1)
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "^Command timed out after 1s$"):
+            task.run_fn({}, 1)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(log.read_text(encoding="utf-8"), "started\npartial error\n")
+
+    @unittest.skipUnless(os.name == "posix", "Requires a POSIX shell process group")
+    def test_shell_task_interrupt_kills_process_group_without_timeout(self):
+        log = self.root / "interrupt.log"
+        release = self.root / "release"
+        child = shlex.join([sys.executable, "-c", (
+            "from pathlib import Path\n"
+            "from time import monotonic, sleep\n"
+            "import sys\n"
+            "print('ready', flush=True)\n"
+            "deadline = monotonic() + 3\n"
+            "while not Path(sys.argv[1]).exists() and monotonic() < deadline: sleep(0.01)\n"
+        ), str(release)])
+        task = shell_task("interrupt", f"{child} & wait", input_hash_fn=lambda _: "input", log_path=log)
+        wait = subprocess.Popen.wait
+        interrupted = False
+
+        def interrupt_once(proc, timeout=None):
+            nonlocal interrupted
+            if interrupted:
+                return wait(proc, timeout=timeout)
+            interrupted = True
+            deadline = time.monotonic() + 2
+            while "ready" not in log.read_text(encoding="utf-8"):
+                self.assertLess(time.monotonic(), deadline, "Timed out waiting for the child")
+                time.sleep(0.01)
+            raise KeyboardInterrupt
+
+        try:
+            with patch.object(subprocess.Popen, "wait", interrupt_once), patch.object(os, "killpg", wraps=os.killpg) as kill:
+                with self.assertRaises(KeyboardInterrupt):
+                    task.run_fn({}, 0)
+                kill.assert_called_once()
+            self.assertEqual(log.read_text(encoding="utf-8"), "ready\n")
+        finally:
+            release.touch()
 
     def test_subagent_gate_pauses_and_writes_packet_for_missing_artifact(self):
         packet = self.root / "packets/request.json"

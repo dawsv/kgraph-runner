@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .._files import read_object, write_json
 from ..engine import GraphFailure, LoopSubgraphNode, SplitterNode, SubgraphNode, TaskNode, sha256_bytes
 from ..helpers import hash_globs, subagent_gate
-from ..qa_metrics import _record_results, init_qa_checklist, write_qa_scorecard
+from ..qa_metrics import _DEFAULT_TESTER, _configured_tester, _record_results, init_qa_checklist, write_qa_scorecard
 from ..verifiers import inspect_png
 from ._common import (
     Repairs, file_hash, files_hash, fingerprint, packet_worker, read_optional, record_verification, revision,
@@ -197,7 +197,7 @@ def _approval_qa_results(value):
     return results
 
 
-def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_retries, work_dir):
+def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_retries, work_dir, reviewer):
     approval = review_dir / "approval.json"
     packet_path = review_dir / "user_approval_packet.json"
     qa_checklist = review_dir / "manual_qa.json"
@@ -224,7 +224,7 @@ def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_ret
             "stale_approval_sha256": current if stale_approval(current, review_hash) else None,
             "outputs": [str(approval)],
             "instructions": [
-                "Daniel must verify the fixes, before and after screenshots, and ZIP in review_summary.md.",
+                f"{reviewer} must verify the fixes, before and after screenshots, and ZIP in review_summary.md.",
                 "After inspecting this review, write approval.json with the decisions below. "
                 "Set either action to false to skip it. Include review_sha256 from this packet.",
                 "Record your re-test in manual_qa.json or include a manual_qa mapping of bug IDs to results.",
@@ -232,7 +232,7 @@ def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_ret
                 "If both rejected_bugs and manual failures are absent, the whole batch will return for fixes.",
             ],
             "approval_example": {
-                "approved": True, "approved_by": "Daniel", "approve_upload_zip": True,
+                "approved": True, "approved_by": reviewer, "approve_upload_zip": True,
                 "approve_commit_main": True, "notes": "", "review_sha256": review_hash,
             },
         }
@@ -244,9 +244,9 @@ def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_ret
             if not isinstance(doc, dict) or type(doc.get("approved")) is not bool:
                 raise ValueError("Provide a JSON object with an approved boolean.")
             approved = doc["approved"]
-            reviewer = doc.get("approved_by") if approved else doc.get("rejected_by", doc.get("approved_by", "Daniel"))
+            decision_by = doc.get("approved_by") if approved else doc.get("rejected_by", doc.get("approved_by", reviewer))
             notes = doc.get("notes", "")
-            if (not _nonempty_text(reviewer) or not isinstance(notes, str)
+            if (not _nonempty_text(decision_by) or not isinstance(notes, str)
                     or any(type(doc.get(key, True)) is not bool for key in ("approve_upload_zip", "approve_commit_main"))):
                 raise ValueError("Provide a reviewer name, text notes, and boolean action decisions.")
             rejected_bugs = None
@@ -267,17 +267,17 @@ def _review_gate(review_dir, review_paths, feedback_path, selected_bugs, max_ret
         if sync_qa:
             try:
                 results = _approval_qa_results(doc["manual_qa"]) if "manual_qa" in doc else []
-                checklist = _record_results(qa_checklist, results, reviewer if results else None)
+                checklist = _record_results(qa_checklist, results, decision_by if results else None)
                 qa_failures = {case["id"]: case for case in checklist["cases"] if case["manual_qa"] == "fail"}
             except (OSError, ValueError) as exc:
                 return doc, (False, "invalid_approval", f"invalid_approval: {exc}"), None
         if approved:
-            return doc, (True, "", f"Release review approved by {reviewer.strip()}"), None
+            return doc, (True, "", f"Release review approved by {decision_by.strip()}"), None
         rejected_bugs = list(dict.fromkeys([*(rejected_bugs or []), *qa_failures]))
         feedback = {"notes": notes, "rejected_bugs": rejected_bugs or bug_ids,
                     "manual_qa": qa_failures,
-                    "rejected_by": reviewer.strip(), "rejected_approval_sha256": current}
-        return doc, (False, "user_rejected", "user_rejected: Daniel requested fixes before release."), feedback
+                    "rejected_by": decision_by.strip(), "rejected_approval_sha256": current}
+        return doc, (False, "user_rejected", f"user_rejected: {decision_by.strip()} requested fixes before release."), feedback
 
     def verify_delivery(ctx, _paths):
         _, result, feedback = read_decision(sync_qa=True)
@@ -367,7 +367,7 @@ def create_histoury_bug_fix_graph(
     bug_reports_url: str = "https://admin.histoury.com/bug-reports",
     version_history_url: str = "https://admin.histoury.com/version-history",
     max_fix_retries: int = 4, max_package_retries: int = 3, max_review_retries: int = 3,
-    timeout_s: Optional[float] = 300.0,
+    timeout_s: Optional[float] = 300.0, tester: Optional[str] = None, reviewer: Optional[str] = None,
 ) -> List[Any]:
     """Compose baseline capture, fix and review, and an approved release."""
     _require_release_id(require_bug_id(batch_id))
@@ -377,6 +377,13 @@ def create_histoury_bug_fix_graph(
         raise ValueError("max_review_retries must be a nonnegative integer")
     if not isinstance(repos, dict) or not repos or not all(map(_nonempty_text, repos)):
         raise ValueError("repos must be a non-empty mapping from repository names to paths")
+    tester = _configured_tester(tester)
+    qa_config = (tester,) if tester is not None else ()
+    if reviewer is None:
+        reviewer = tester or _DEFAULT_TESTER
+    elif not _nonempty_text(reviewer):
+        raise ValueError("reviewer must be non-empty text")
+    reviewer = reviewer.strip()
     repos = {name: Path(path).resolve() for name, path in repos.items()}
     build_cmds, test_cmds, verify_fns = (dict(value or {}) for value in (build_cmds, test_cmds, verify_fns))
     watch_globs = tuple(watch_globs)
@@ -392,7 +399,7 @@ def create_histoury_bug_fix_graph(
         return _batch_bugs(read_object(batch_path), batch_id, product, repos)
 
     user_gate, verify_review, repair_review, approved_action = _review_gate(
-        review_dir, review_paths, feedback_path, selected_bugs, max_review_retries, work_dir,
+        review_dir, review_paths, feedback_path, selected_bugs, max_review_retries, work_dir, reviewer,
     )
 
     def ui_bugs():
@@ -447,7 +454,7 @@ def create_histoury_bug_fix_graph(
             test_cmd=test_cmds.get(bug_id, test_cmds.get(repo)),
             verify_fn=verify_fns.get(bug_id, verify_fns.get(repo)),
             watch_globs=watch_globs, max_retries=max_fix_retries, timeout_s=timeout_s,
-            review_feedback=review_feedback,
+            review_feedback=review_feedback, tester=tester,
         )
 
     def fix_paths(bug):
@@ -481,7 +488,7 @@ def create_histoury_bug_fix_graph(
         sources.append(Path(read_object(package_manifest)["zip_path"]))
         if feedback_path.is_file():
             sources.append(feedback_path)
-        return fingerprint("qa-v1", batch_config, version_history_url, files_hash(sources), evidence)
+        return fingerprint("qa-v1", batch_config, version_history_url, files_hash(sources), evidence, *qa_config)
 
     def prepare_review(_ctx, _attempt):
         batch_bugs = selected_bugs()
@@ -519,7 +526,7 @@ def create_histoury_bug_fix_graph(
                     lines.append(f"- {stage.capitalize()} screenshot: `{path}`")
         qa_checklist = review_dir / "manual_qa.json"
         init_qa_checklist(qa_checklist, batch_id=batch_id, workflow_type="histoury-bug-fix",
-                          title=f"Histoury bug-fix review for {batch_id}",
+                          title=f"Histoury bug-fix review for {batch_id}", tester=tester,
                           cases=[_bug_qa_case(item["bug"], item["fix"]) for item in fixes])
         write_qa_scorecard(qa_checklist)
         lines.extend(["", "## Manual re-test", "", "[QA Scorecard](qa_scorecard.md) · [Checklist](manual_qa.json)"])

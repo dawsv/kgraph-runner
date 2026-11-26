@@ -11,15 +11,20 @@ from .engine import (
     sha256_file,
     sha256_json,
 )
-from .helpers import DEFAULT_IGNORE_DIRS, hash_globs, hash_paths, shell_task, subagent_gate
+from .helpers import DEFAULT_IGNORE_DIRS, clear_hash_cache, hash_globs, hash_paths, shell_task, subagent_gate
 from .interactions import (
     ask_node_question,
+    find_run_qa_checklist,
+    read_node_log_tail,
     read_node_progress,
     read_remote_response,
+    read_run_qa,
     read_subtask_answer,
     submit_gate_response,
+    submit_run_qa,
     update_node_progress,
 )
+from .network import fetch_remote_response
 from .qa_metrics import (
     aggregate_qa_history,
     compute_qa_scorecard,
@@ -30,7 +35,7 @@ from .qa_metrics import (
 )
 from .registry import list_runs, register_run
 from .server import create_hub_server, create_town_server
-from .snapshot import build_town_snapshot
+from .snapshot import build_town_snapshot, cached_town_snapshot
 from .subgraphs import (
     create_bug_batch_graph,
     create_desktop_bug_fix_subgraph,
@@ -52,6 +57,7 @@ __all__ = [
     "SplitterNode",
     "SubgraphNode",
     "TaskNode",
+    "clear_hash_cache",
     "hash_globs",
     "hash_paths",
     "sha256_bytes",
@@ -77,14 +83,20 @@ __all__ = [
     "write_qa_scorecard",
     "ask_node_question",
     "build_town_snapshot",
+    "cached_town_snapshot",
     "create_hub_server",
     "create_town_server",
+    "fetch_remote_response",
+    "find_run_qa_checklist",
     "list_runs",
+    "read_node_log_tail",
     "read_node_progress",
     "read_remote_response",
+    "read_run_qa",
     "read_subtask_answer",
     "register_run",
     "render_town_html",
     "submit_gate_response",
+    "submit_run_qa",
     "update_node_progress",
 ]

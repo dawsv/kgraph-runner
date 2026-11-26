@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from .._files import read_object, require_id, write_json
 from ..engine import LoopSubgraphNode, TaskNode
 from ..helpers import hash_globs
-from ..qa_metrics import init_qa_checklist, write_qa_scorecard
+from ..qa_metrics import _configured_tester, init_qa_checklist, write_qa_scorecard
 from ._common import Repairs, files_hash, fingerprint, packet_worker, record_verification, verification, with_retry_route
 
 Command = Union[str, Sequence[str]]
@@ -123,11 +123,13 @@ def create_desktop_bug_fix_subgraph(
     verify_fn: Optional[Verifier] = None, resource: Optional[str] = "repo",
     timeout_s: Optional[float] = 300.0, max_retries: int = 4,
     deps: Tuple[str, ...] = (), node_id: Optional[str] = None,
-    review_feedback: Optional[dict] = None,
+    review_feedback: Optional[dict] = None, tester: Optional[str] = None,
 ) -> LoopSubgraphNode:
     """Pause for a fix report, then build, test, and request repairs as needed."""
     spec = dict(bug_spec)
     bug_id = require_bug_id(spec.get("id"))
+    tester = _configured_tester(tester)
+    qa_config = (tester,) if tester is not None else ()
     commands = {
         "build": _command(build_cmd, "build_cmd"),
         "repro": _command(repro_cmd, "repro_cmd"),
@@ -245,7 +247,7 @@ def create_desktop_bug_fix_subgraph(
             "log_paths": existing_logs(),
         }
         init_qa_checklist(qa_checklist, batch_id=bug_id, workflow_type="desktop-bug-fix",
-                          title=fix["title"], cases=[_bug_qa_case(spec, fix)])
+                          title=fix["title"], tester=tester, cases=[_bug_qa_case(spec, fix)])
         write_json(final_summary, fix)
         return True, "", f"Verified fix for {bug_id}"
 
@@ -272,7 +274,7 @@ def create_desktop_bug_fix_subgraph(
     final = record_verification(
         "verify_fix", path=verify_result,
         input_hash=lambda: fingerprint(verification_inputs(build_result, test_result), repairs.instructions(),
-                                       "qa-v1", review_feedback),
+                                       "qa-v1", review_feedback, *qa_config),
         check=check_fix, deps=("run_tests",),
     )
     final.outputs_fn = lambda _ctx: (
@@ -313,10 +315,13 @@ def create_bug_batch_graph(
     test_cmd: Optional[Command] = None, watch_globs: Sequence[str] = (),
     verify_fn: Optional[Verifier] = None, resource: Optional[str] = "repo",
     timeout_s: Optional[float] = 300.0, max_retries: int = 4, batch_id: Optional[str] = None,
+    tester: Optional[str] = None,
 ) -> List[Any]:
     """Fix bugs in one checkout and publish a single report after verification."""
     work_dir = Path(work_dir).resolve()
     batch_id = batch_id or work_dir.name or "bug-batch"
+    tester = _configured_tester(tester)
+    qa_config = (tester,) if tester is not None else ()
     qa_checklist = work_dir / "manual_qa.json"
     defaults = {"repro_cmd": repro_cmd, "build_cmd": build_cmd, "test_cmd": test_cmd,
                 "watch_globs": watch_globs, "max_retries": max_retries}
@@ -332,7 +337,7 @@ def create_bug_batch_graph(
         specs.append(spec)
         nodes.append(create_desktop_bug_fix_subgraph(
             spec, work_dir=work_dir, repo_dir=repo_dir, verify_fn=verify_fn,
-            resource=resource, timeout_s=timeout_s,
+            resource=resource, timeout_s=timeout_s, tester=tester,
             deps=(nodes[-1].id,) if resource and nodes else (), **overrides,
         ))
         nodes[-1].qa_checklist_path = qa_checklist
@@ -344,7 +349,7 @@ def create_bug_batch_graph(
     def report(_ctx, _attempt):
         fixes = [read_object(path) for path in summaries]
         init_qa_checklist(qa_checklist, batch_id=batch_id, workflow_type="bug-batch", title="Bug fix batch",
-                          cases=[_bug_qa_case(spec, fix) for spec, fix in zip(specs, fixes)])
+                          tester=tester, cases=[_bug_qa_case(spec, fix) for spec, fix in zip(specs, fixes)])
         write_qa_scorecard(qa_checklist)
         write_json(json_report, {"fixed_count": len(fixes), "bugs": fixes})
         noun = "fix" if len(fixes) == 1 else "fixes"
@@ -361,7 +366,7 @@ def create_bug_batch_graph(
 
     report_node = TaskNode(
         id="consolidated_report", kind="code", deps=tuple(node.id for node in nodes),
-        run_fn=report, input_hash_fn=lambda _ctx: fingerprint("qa-v1", batch_id, specs, files_hash(summaries)),
+        run_fn=report, input_hash_fn=lambda _ctx: fingerprint("qa-v1", batch_id, specs, files_hash(summaries), *qa_config),
         outputs_fn=lambda _ctx: (json_report, markdown_report),
     )
     report_node.qa_checklist_path = qa_checklist

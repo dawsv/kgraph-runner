@@ -12,11 +12,16 @@ import json
 import logging
 from pathlib import Path
 import socket
+from threading import Event
+from time import monotonic
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import webbrowser
 
 from ._files import read_object
-from .interactions import _apply_remote_response, _reject_constant, read_remote_response, submit_gate_response
+from .interactions import (
+    _apply_remote_response, _reject_constant, read_node_log_tail, read_remote_response, read_run_qa,
+    submit_gate_response, submit_run_qa,
+)
 from .network import CloudflareTunnel, discover_access_urls, generate_token, with_token
 from .registry import _entry, get_run, ingest_remote_run, list_runs, remove_run
 from .snapshot import _snapshot_from_graph
@@ -26,6 +31,7 @@ from .ui import APP_ICON, PWA_META, render_town_html
 _LOG = logging.getLogger(__name__)
 _MAX_INGEST_BYTES = 2 * 1024 * 1024
 _MAX_RESPONSE_BYTES = 256 * 1024
+_EVENT_KEEPALIVE_SECONDS = 15
 _MANIFEST = {
     "id": "/",
     "name": "Hero Town — KGraph",
@@ -129,6 +135,7 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
         raise ValueError("--port must be between 0 and 65535")
     mode = "hub" if snapshot_fn is None else "single"
     expected = token.encode("utf-8") if token else None
+    responses_enabled = expected is not None and not read_only
 
     class TownHandler(BaseHTTPRequestHandler):
         def _send(self, body, content_type, status=HTTPStatus.OK, *, run_id=None):
@@ -186,6 +193,86 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
             else:
                 self._send(_unlock_page(run), "text/html", HTTPStatus.UNAUTHORIZED)
 
+        def _snapshot(self, selected):
+            active = None
+            if mode == "hub":
+                runs = list_runs(watch_dirs)
+                active = next((run for run in runs if run["id"] == selected), runs[0] if runs else None)
+                snapshot = _hub_snapshot(active)
+            else:
+                snapshot = snapshot_fn()
+            return (snapshot if responses_enabled else _disable_responses(snapshot)), active
+
+        def _event_snapshot(self, selected):
+            snapshot, active = self._snapshot(selected)
+            if mode == "hub":
+                return {**snapshot, "run_id": active["id"] if active else None}
+            return snapshot
+
+        def _events(self, selected):
+            snapshot = self._event_snapshot(selected)
+            stop = self.server._stop_event
+            previous = None
+            keepalive_at = monotonic() + _EVENT_KEEPALIVE_SECONDS
+            try:
+                self.connection.settimeout(5)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                while not stop.is_set():
+                    comparable = json.dumps({key: value for key, value in snapshot.items() if key != "generated_at"},
+                                            sort_keys=True)
+                    if comparable != previous:
+                        self.wfile.write(f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                        previous = comparable
+                    now = monotonic()
+                    if now >= keepalive_at:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        keepalive_at = now + _EVENT_KEEPALIVE_SECONDS
+                    if stop.wait(min(poll_ms / 1000, keepalive_at - now)):
+                        break
+                    snapshot = self._event_snapshot(selected)
+            except OSError:
+                # Clients can disconnect while an event or heartbeat is in flight.
+                pass
+            except Exception:
+                _LOG.exception("Could not update town event stream")
+            finally:
+                self.close_connection = True
+
+        def _run_api_target(self, path):
+            prefix, _, endpoint = path.rpartition("/")
+            if endpoint not in ("logs", "qa"):
+                return None, None
+            if mode == "single" and prefix == "/api":
+                return endpoint, None
+            if mode == "hub" and prefix.startswith("/api/runs/"):
+                return endpoint, unquote(prefix.removeprefix("/api/runs/"))
+            return None, None
+
+        def _run_for_api(self, run_id, *, require_state=True):
+            if run_id is not None:
+                return get_run(run_id, watch_dirs)
+            snapshot = snapshot_fn()
+            if require_state and not snapshot.get("state_file"):
+                return {}
+            return _single_run(snapshot)
+
+        def _run_data(self, endpoint, run_id, query):
+            run = self._run_for_api(run_id)
+            if run is None:
+                return self._json({"error": "Run not found"}, HTTPStatus.NOT_FOUND)
+            if endpoint == "logs":
+                status, result = read_node_log_tail(run, query.get("path"), max_bytes=query.get("max_bytes", 32768))
+            else:
+                status, result = read_run_qa(run, can_edit=responses_enabled)
+            return self._json(result, status)
 
         def do_GET(self):
             parsed = urlsplit(self.path)
@@ -211,25 +298,20 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
                 response = read_remote_response(run_id)
                 return self._json(response) if response is not None else self._json(
                     {"error": "No queued response for this run"}, HTTPStatus.NOT_FOUND)
-            if path not in ("/", "/api/snapshot", "/api/runs"):
+            endpoint, run_id = self._run_api_target(path)
+            if endpoint is None and path not in ("/", "/api/snapshot", "/api/runs", "/api/events"):
                 return self.send_error(HTTPStatus.NOT_FOUND)
 
             try:
-                active = None
-                if mode == "hub":
-                    runs = list_runs(watch_dirs)
-                    active = next((run for run in runs if run["id"] == selected), runs[0] if runs else None)
-                    if path != "/api/runs":
-                        snapshot = _hub_snapshot(active)
-                else:
-                    snapshot = snapshot_fn()
-                    runs = [_single_run(snapshot)] if path == "/api/runs" else None
-                responses_enabled = expected is not None and not read_only
-                if path != "/api/runs" and not responses_enabled:
-                    snapshot = _disable_responses(snapshot)
+                if endpoint is not None:
+                    return self._run_data(endpoint, run_id, query)
+                if path == "/api/events":
+                    return self._events(selected)
                 if path == "/api/runs":
-                    self._json({"runs": runs})
-                elif path == "/api/snapshot":
+                    runs = list_runs(watch_dirs) if mode == "hub" else [_single_run(snapshot_fn())]
+                    return self._json({"runs": runs})
+                snapshot, active = self._snapshot(selected)
+                if path == "/api/snapshot":
                     # Route remote snapshots by the registry ID.
                     remote_id = active["id"] if active and active.get("source") == "remote" else None
                     self._json(snapshot, run_id=remote_id)
@@ -239,9 +321,13 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
                         snapshot, live_url="/api/snapshot", poll_ms=poll_ms,
                         runs_url="/api/runs" if mode == "hub" else None,
                         respond_url=respond_url,
+                        events_url="/api/events",
+                        logs_url="/api/runs" if mode == "hub" else "/api/logs",
+                        qa_url="/api/runs" if mode == "hub" else "/api/qa",
                         active_run_id=active["id"] if active else snapshot.get("run_id"),
                         access_urls=self.server.access_urls,
                         layout_mode=layout_mode,
+                        read_only=read_only,
                     )
                     self._send(html, "text/html")
             except Exception:
@@ -306,34 +392,40 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
             scheme = self.headers.get("X-Forwarded-Proto", "http").lower()
             return bool(host and scheme in ("http", "https") and origins[0].lower() == f"{scheme}://{host}")
 
-        def _respond(self, parsed, run_id=None):
+        def _submit_interaction(self, parsed, run_id=None, *, qa=False):
+            if read_only:
+                return self._json({"error": "This shared Hero Town view is read-only"}, HTTPStatus.FORBIDDEN)
             if expected is None or not self._authenticated(dict(parse_qsl(parsed.query)).get("token")):
                 return self._unauthorized(parsed.path, "")
             if not self._same_origin_submission():
                 return self._json({"error": "Cross-origin submissions are forbidden"}, HTTPStatus.FORBIDDEN)
-            payload, error = self._json_body(_MAX_RESPONSE_BYTES, "Response payload exceeds 256 KiB")
+            subject = "QA" if qa else "Response"
+            payload, error = self._json_body(_MAX_RESPONSE_BYTES, f"{subject} payload exceeds 256 KiB")
             if error:
                 return self._json({"error": error[1]}, error[0])
             try:
-                run = get_run(run_id, watch_dirs) if run_id is not None else _single_run(snapshot_fn())
+                run = self._run_for_api(run_id, require_state=qa)
                 if run is None:
                     return self._json({"error": "Run not found"}, HTTPStatus.NOT_FOUND)
-                status, decision = submit_gate_response(run, payload)
-                return self._json(decision, status)
+                submit = submit_run_qa if qa else submit_gate_response
+                status, result = submit(run, payload)
+                return self._json(result, status)
             except Exception:
-                _LOG.exception("Could not deliver gate response")
-                return self._json({"error": "Could not deliver gate response"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                message = "Could not record manual QA" if qa else "Could not deliver gate response"
+                _LOG.exception(message)
+                return self._json({"error": message}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
         def do_POST(self):
             parsed = urlsplit(self.path)
             path = parsed.path
             if mode == "single" and path == "/api/respond":
-                if read_only:
-                    return self._json({"error": "This shared Hero Town view is read-only"}, HTTPStatus.FORBIDDEN)
-                return self._respond(parsed)
+                return self._submit_interaction(parsed)
+            endpoint, run_id = self._run_api_target(path)
+            if endpoint == "qa":
+                return self._submit_interaction(parsed, run_id, qa=True)
             if mode == "hub" and path.startswith("/api/runs/") and path.endswith("/respond"):
                 run_id = unquote(path.removeprefix("/api/runs/").removesuffix("/respond"))
-                return self._respond(parsed, run_id)
+                return self._submit_interaction(parsed, run_id)
             if mode == "hub" and path.startswith("/api/runs/") and path.endswith("/delete"):
                 return self._delete_run(parsed, path.removesuffix("/delete"))
             if path == "/api/ingest" and mode == "hub":
@@ -347,11 +439,11 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
                 if not self._authenticated(None):
                     return self._unauthorized(path, "")
                 return self.send_error(HTTPStatus.NOT_FOUND)
+            body, error = self._request_body(4096, "Auth payload exceeds 4 KiB")
+            if error:
+                return self.send_error(*error)
             try:
-                size = int(self.headers.get("Content-Length", "0"))
-                if not 0 <= size <= 4096:
-                    return self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-                form = dict(parse_qsl(self.rfile.read(size).decode("utf-8")))
+                form = dict(parse_qsl(body.decode("utf-8")))
             except ValueError:
                 return self.send_error(HTTPStatus.BAD_REQUEST)
             run = form.get("run", "")
@@ -360,6 +452,8 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
             return self._unauthorized("/", run)
 
         def _delete_run(self, parsed, path):
+            if read_only:
+                return self._json({"error": "This shared Hero Town view is read-only"}, HTTPStatus.FORBIDDEN)
             if not self._authenticated(dict(parse_qsl(parsed.query)).get("token")):
                 return self._unauthorized(parsed.path, "")
             if not self._same_origin_submission():
@@ -389,6 +483,18 @@ def _create_server(*, host, port, poll_ms, token, snapshot_fn=None, watch_dirs=(
         allow_reuse_address = True
         address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
 
+        def __init__(self, *args, **kwargs):
+            self._stop_event = Event()
+            super().__init__(*args, **kwargs)
+
+        def shutdown(self):
+            self._stop_event.set()
+            return super().shutdown()
+
+        def server_close(self):
+            self._stop_event.set()
+            return super().server_close()
+
         def server_bind(self):
             if host == "::" and socket.has_dualstack_ipv6():
                 self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -410,9 +516,10 @@ def create_town_server(snapshot_fn, *, host="127.0.0.1", port=8765, poll_ms=1200
                           layout_mode=layout_mode, read_only=read_only)
 
 
-def create_hub_server(watch_dirs=(), *, host="127.0.0.1", port=8765, poll_ms=1200, token=None):
+def create_hub_server(watch_dirs=(), *, host="127.0.0.1", port=8765, poll_ms=1200, token=None, read_only=False):
     """Bind a town server that serves the machine's registered workflows."""
-    return _create_server(watch_dirs=tuple(watch_dirs), host=host, port=port, poll_ms=poll_ms, token=token)
+    return _create_server(watch_dirs=tuple(watch_dirs), host=host, port=port, poll_ms=poll_ms, token=token,
+                          read_only=read_only)
 
 
 def _serve(create, *, host, port, poll_ms, open_browser, token, tunnel, no_auth):

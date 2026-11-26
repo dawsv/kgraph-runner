@@ -19,12 +19,28 @@ class QAMetricsTest(unittest.TestCase):
         self.root = Path(temp.name)
         self.checklist = self.root / "manual_qa.json"
         self.history = self.root / "history.jsonl"
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KGRAPH_TESTER", None)
 
     def read(self, path):
         return json.loads(path.read_text(encoding="utf-8"))
 
     def init(self, cases, **kwargs):
         return init_qa_checklist(self.checklist, batch_id="desktop-42", cases=cases, **kwargs)
+
+    def test_tester_uses_environment_and_explicit_override(self):
+        cases = [{"id": "a"}]
+        self.assertEqual(self.init(cases)["tester"], "Daniel")
+        with patch.dict(os.environ, {"KGRAPH_TESTER": "  Hà  "}):
+            self.assertEqual(self.init(cases)["tester"], "Hà")
+            self.assertEqual(self.init(cases, tester="Daniel")["tester"], "Daniel")
+            result = record_qa_result(self.checklist, case_id="a", manual_qa="pass")
+            self.assertEqual(result["tester"], "Hà")
+            result = record_qa_result(self.checklist, case_id="a", manual_qa="pass", tester="Alex")
+            self.assertEqual(result["tester"], "Alex")
+        self.assertEqual(self.init(cases)["tester"], "Alex")
 
     def test_state_paths_aliases_ambiguity_and_missing_state(self):
         state = self.root / "state.json"
@@ -77,6 +93,28 @@ class QAMetricsTest(unittest.TestCase):
         self.init([{"id": "zero"}])
         self.assertEqual(record_qa_result(self.checklist, case_id="zero", manual_qa="pass")["cases"][0]
                          ["resolved_on_attempt"], 1)
+
+    def test_editing_a_pass_preserves_the_resolved_attempt_unless_explicit(self):
+        self.init([{"id": "a", "ai_attempts": 4}])
+        record_qa_result(self.checklist, case_id="a", manual_qa="pass", resolved_on_attempt=2)
+        case, = record_qa_result(self.checklist, case_id="a", manual_qa="pass", notes="Retest confirmed")["cases"]
+        self.assertEqual((case["resolved_on_attempt"], case["notes"]), (2, "Retest confirmed"))
+        case, = record_qa_result(self.checklist, case_id="a", manual_qa="pass", resolved_on_attempt=3)["cases"]
+        self.assertEqual(case["resolved_on_attempt"], 3)
+        record_qa_result(self.checklist, case_id="a", manual_qa="fail")
+        case, = record_qa_result(self.checklist, case_id="a", manual_qa="pass")["cases"]
+        self.assertEqual(case["resolved_on_attempt"], 4)
+
+    def test_refresh_keeps_the_tester_attributed_to_preserved_manual_results(self):
+        cases = [{"id": "a"}]
+        self.init(cases, tester="Original")
+        record_qa_result(self.checklist, case_id="a", manual_qa="pass", notes="Verified")
+        with patch.dict(os.environ, {"KGRAPH_TESTER": "New default"}):
+            preserved = self.init(cases)
+            self.assertEqual((preserved["tester"], preserved["cases"][0]["notes"]), ("Original", "Verified"))
+            self.assertEqual(self.init(cases, tester="Explicit")["tester"], "Explicit")
+            changed = self.init([{"id": "a", "ai_attempts": 1}])
+            self.assertEqual((changed["tester"], changed["cases"][0]["manual_qa"]), ("New default", "not_tested"))
 
     def test_invalid_inputs_leave_existing_checklist_intact(self):
         self.init([{"id": "stable"}])

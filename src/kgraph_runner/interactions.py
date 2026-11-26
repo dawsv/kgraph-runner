@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from codecs import getincrementaldecoder
 from datetime import datetime, timezone
 from graphlib import TopologicalSorter
 from hashlib import sha256
@@ -13,6 +14,9 @@ import stat
 from typing import Optional
 
 from ._files import file_lock, valid_id, write_json
+from .qa_metrics import (
+    GAP_TYPES, MANUAL_QA_VALUES, _run_qa_checklist, compute_qa_scorecard, record_qa_result, write_qa_scorecard,
+)
 
 
 _PROGRESS_STATUSES = ("pending", "running", "passed", "cached", "failed", "awaiting_subagents")
@@ -700,7 +704,7 @@ def _active_gate(state, report, requested):
     return None, None
 
 
-def _resolve_packet(raw, state, report, project):
+def _resolve_packet(raw, state, report, project, *, watch=None):
     if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
         raise ValueError("The active gate has no packet")
     path = Path(raw)
@@ -708,11 +712,218 @@ def _resolve_packet(raw, state, report, project):
     root = _allowed_root(state)
     bases = [project, root.parent, report.parent, state.parent]
     candidates = [path] if path.is_absolute() else [base / path for base in bases if base is not None]
+    if watch is not None:
+        for candidate in candidates:
+            watch(candidate)
     candidate = next((value for value in candidates if value.is_file()), candidates[0])
     resolved = _inside(candidate, root)
     if not resolved.is_file():
         raise ValueError("The active gate packet is unavailable")
     return candidate
+
+
+def _local_run_state(run):
+    raw = run.get("state_path")
+    if not isinstance(raw, (str, Path)) or not raw:
+        raise PermissionError("This operation requires a local run")
+    # As with gate responses, only a locally registered report authorizes
+    # using the state path when the current snapshot was pushed to the Hub.
+    if run.get("source") == "remote" and not (run.get("report_path") and Path(raw).is_file()):
+        raise PermissionError("This operation requires a local run")
+    state = Path(raw).resolve()
+    return state, _allowed_root(state)
+
+
+def _resolve_log_path(raw, root, bases):
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        raise ValueError("A valid log path is required")
+    path = Path(raw)
+    _reject_path_traversal(path)
+    if path.is_absolute():
+        return _inside(path, root)
+
+    # Engine outputs are relative to the project. Progress can also refer to
+    # files relative to the run directory or the .kgraph root.
+    candidates = [base / path for base in bases]
+    candidate = next((item for item in candidates if item.exists() or item.is_symlink()), None)
+    if candidate is None:
+        candidate = next((item for item in candidates if item.is_relative_to(root)), None)
+    if candidate is None:
+        raise PermissionError("The log must be inside the workflow's .kgraph directory")
+    return _inside(candidate, root)
+
+
+def _recorded_output_paths(state, root):
+    for value in _object(_optional_object(state).get("nodes")).values():
+        record = _object(value)
+        outputs = record.get("outputs")
+        if isinstance(outputs, list):
+            yield from outputs
+        yield from _object(record.get("output_hashes"))
+    progress_path = progress_path_for_state(state)
+    try:
+        progress = _read_progress_file(_inside(progress_path, root))
+    except (OSError, ValueError, RuntimeError):
+        return
+    for entry in progress.values():
+        for item in entry["items"].values():
+            outputs = item.get("outputs")
+            if isinstance(outputs, list):
+                yield from outputs
+
+
+def read_node_log_tail(run, raw_path, *, max_bytes=32768) -> tuple[int, dict]:
+    """Read a bounded, redacted tail from a recorded local output."""
+    if raw_path is None or (isinstance(raw_path, str) and not raw_path.strip()):
+        return 400, {"error": "A log path is required"}
+    try:
+        limit = max(256, min(131072, int(max_bytes)))
+    except (TypeError, ValueError, OverflowError):
+        return 400, {"error": "max_bytes must be an integer"}
+    try:
+        state, root = _local_run_state(run)
+        project = Path(run.get("project_dir") or root.parent).resolve()
+        bases = tuple(dict.fromkeys((project, root.parent, state.parent, root)))
+        resolved = _resolve_log_path(raw_path, root, bases)
+        for output in _recorded_output_paths(state, root):
+            try:
+                if _resolve_log_path(output, root, bases) == resolved:
+                    break
+            except (OSError, ValueError, RuntimeError):
+                continue
+        else:
+            return 403, {"error": "The log path is not a recorded output"}
+        if not stat.S_ISREG(resolved.stat().st_mode):
+            raise PermissionError("The log must be a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with os.fdopen(os.open(resolved, flags), "rb") as file:
+            info = os.fstat(file.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise PermissionError("The log must be a regular file")
+            size = info.st_size
+            start = max(0, size - limit - 4096)
+            file.seek(start)
+            window = file.read(size - start)
+            lookback = max(0, size - limit - start)
+            decoder = getincrementaldecoder("utf-8")(errors="replace")
+            prefix = decoder.decode(window[:lookback])
+            content = prefix + decoder.decode(window[lookback:], final=True)
+            cutoff = trim = len(prefix)
+            replacement = "[redacted]"
+
+            def redact(match):
+                nonlocal trim
+                start, end = match.span()
+                if end <= cutoff:
+                    trim += len(replacement) - (end - start)
+                elif start < cutoff:
+                    # Start at the placeholder when the cutoff crosses a credential.
+                    trim -= cutoff - start
+                return replacement
+
+            content = _CREDENTIAL.sub(redact, content)[trim:][-limit:]
+    except FileNotFoundError:
+        return 404, {"error": "Log file not found"}
+    except (OSError, ValueError, RuntimeError):
+        return 403, {"error": "The log must be a recorded regular file inside the workflow's .kgraph directory"}
+    return 200, {"path": str(resolved), "name": resolved.name, "content": content,
+                 "size_bytes": size, "truncated": size > limit}
+
+
+def _find_qa_checklist(state, root, run):
+    def checked(path):
+        try:
+            resolved = _inside(path, root)
+            # An implicit checklist directory must not alias another run's files.
+            if resolved == path and not path.is_symlink() and resolved.is_file():
+                return resolved
+        except (OSError, RuntimeError):
+            pass
+        return None
+
+    report = run.get("report_path")
+    if isinstance(report, (str, Path)) and report:
+        report = Path(report)
+        try:
+            declared = _optional_object(report).get("qa_checklist_path")
+        except (OSError, ValueError, RecursionError):
+            declared = None
+        if isinstance(declared, str) and declared.strip() and "\0" not in declared:
+            path = Path(declared)
+            try:
+                _reject_path_traversal(path)
+            except PermissionError:
+                pass
+            else:
+                bases = (root.parent, report.resolve().parent, state.parent, root)
+                candidates = (path,) if path.is_absolute() else (base / path for base in bases)
+                for candidate in candidates:
+                    if resolved := checked(candidate):
+                        return resolved
+
+    preferred = [_run_qa_checklist(state)]
+    if state.parent != root:
+        preferred.extend((state.parent / "review" / "manual_qa.json", state.parent / "manual_qa.json"))
+    for candidate in preferred:
+        if resolved := checked(candidate):
+            return resolved
+    return None
+
+
+def find_run_qa_checklist(run) -> Optional[Path]:
+    """Find the first safe checklist for a local run."""
+    try:
+        state, root = _local_run_state(run)
+        return _find_qa_checklist(state, root, run)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def read_run_qa(run, *, can_edit=False) -> tuple[int, dict]:
+    """Return the run's current manual QA scorecard."""
+    checklist = find_run_qa_checklist(run)
+    if checklist is None:
+        return 200, {"available": False}
+    try:
+        root = _allowed_root(run["state_path"])
+        scorecard = compute_qa_scorecard(_read_json(checklist)[0])
+    except FileNotFoundError:
+        return 200, {"available": False}
+    except PermissionError as exc:
+        return 403, {"error": str(exc)}
+    except (ValueError, RecursionError) as exc:
+        return 400, {"error": str(exc)}
+    return 200, {"available": True, "can_edit": bool(can_edit),
+                 "checklist_path": str(checklist.relative_to(root)), "scorecard": scorecard,
+                 "manual_qa_values": list(MANUAL_QA_VALUES), "gap_types": [gap for gap in GAP_TYPES if gap is not None]}
+
+
+def submit_run_qa(run, payload) -> tuple[int, dict]:
+    """Record a manual QA result and regenerate the checklist's scorecards."""
+    if not isinstance(payload, dict):
+        return 400, {"error": "Payload must be a JSON object"}
+    checklist = find_run_qa_checklist(run)
+    if checklist is None:
+        return 404, {"error": "QA checklist not found"}
+    try:
+        attempt = payload.get("resolved_on_attempt")
+        if attempt is not None and (type(attempt) is not int or attempt < 1):
+            raise ValueError("resolved_on_attempt must be a positive integer")
+        lock_path = checklist.with_name(checklist.name + ".lock")
+        if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+            raise PermissionError("The QA checklist lock must be a regular file")
+        record_qa_result(checklist, case_id=payload.get("case_id"), manual_qa=payload.get("manual_qa"),
+                         gap_type=payload.get("gap_type"), notes=payload.get("notes"),
+                         resolved_on_attempt=attempt, tester=payload.get("tester"))
+        scorecard = write_qa_scorecard(checklist)
+    except FileNotFoundError:
+        return 404, {"error": "QA checklist not found"}
+    except PermissionError as exc:
+        return 403, {"error": str(exc)}
+    except (ValueError, RecursionError) as exc:
+        return 400, {"error": str(exc)}
+    return 200, {"ok": True, "available": True, "can_edit": True, "scorecard": scorecard}
 
 
 def _response_path(run_id):

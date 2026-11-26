@@ -14,6 +14,7 @@ import threading
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from kgraph_runner import (
@@ -25,6 +26,7 @@ from kgraph_runner.interactions import (
     build_node_sub_graph, extract_input_gate, progress_path_for_state, read_remote_response,
     submit_gate_response, validate_kgraph_output_path,
 )
+from kgraph_runner.qa_metrics import init_qa_checklist
 from kgraph_runner.registry import ingest_remote_run, list_runs, register_run
 from kgraph_runner.server import create_hub_server, create_town_server
 
@@ -286,6 +288,73 @@ class InteractionsTests(unittest.TestCase):
         _, live = self.request(base, f"/api/snapshot?run={run['id']}")
         self.assertEqual(live["attention"]["input_gate"]["questions"][0]["ticket"], "b1")
         self.assertEqual(list_runs()[0]["source"], "local")
+
+    def test_hub_logs_and_qa_require_local_registration_for_pushed_runs(self):
+        log = self.state.with_name("worker.log")
+        checklist = self.state.with_name("manual_qa.json")
+        self.write(self.state, {"nodes": {"worker": {"status": "failed", "outputs": [str(log)]}}})
+        self.write(self.report, {"status": "failed"})
+        log.write_text("Worker output\n", encoding="utf-8")
+        init_qa_checklist(checklist, batch_id="test", cases=[{"id": "check"}])
+        local = register_run(self.project / "workflow.py", self.state, self.report, project_dir=self.project)
+        snapshot = self.snapshot()
+        pushed = ingest_remote_run({"source_host": socket.gethostname()}, snapshot)
+        self.assertEqual(pushed["id"], local["id"])
+        self.assertEqual(list_runs()[0]["source"], "remote")
+        remote = ingest_remote_run({"source_host": "remote-worker"}, snapshot)
+        base = self.serve(create_hub_server(port=0, token="test-token"))
+        pushed_route = f"/api/runs/{pushed['id']}"
+        remote_route = f"/api/runs/{remote['id']}"
+        logs = "/logs?" + urlencode({"path": log})
+
+        status, result = self.request(base, pushed_route + logs)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["content"], "Worker output\n")
+        self.assertEqual(self.request(base, remote_route + logs)[0], 403)
+        self.assertEqual(self.request(base, remote_route + "/qa"), (200, {"available": False}))
+        status, qa = self.request(base, pushed_route + "/qa")
+        self.assertEqual(status, 200)
+        self.assertEqual(qa["scorecard"]["cases"][0]["id"], "check")
+        payload = {"case_id": "check", "manual_qa": "pass"}
+        self.assertEqual(self.request(base, remote_route + "/qa", "POST", payload)[0], 404)
+        status, updated = self.request(base, pushed_route + "/qa", "POST", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["scorecard"]["cases"][0]["manual_qa"], "pass")
+
+    def test_snapshot_redacts_failure_details_in_state_and_report(self):
+        detail = "Command failed with api_key=example-test-key and password='test passphrase'"
+        self.write(self.state, {"nodes": {"worker": {"kind": "worker", "status": "failed", "detail": detail}}})
+        self.write(self.report, {"status": "failed", "error": f"[worker] {detail}",
+                                 "failure_signatures": [{"node": "worker", "detail": detail}]})
+        snapshot = self.snapshot()
+        redacted = "Command failed with [redacted] and [redacted]"
+        self.assertEqual(snapshot["nodes"][0]["detail"], redacted)
+        self.assertEqual(snapshot["failure_signatures"][0]["detail"], redacted)
+        encoded = json.dumps(snapshot)
+        self.assertNotIn("example-test-key", encoded)
+        self.assertNotIn("test passphrase", encoded)
+
+    def test_snapshot_expands_nested_splitters(self):
+        workflow = self.project / "workflow.py"
+        workflow.write_text('''
+from kgraph_runner import SplitterNode, TaskNode
+
+def leaf(name, ctx):
+    return TaskNode(name, "code", lambda ctx, attempt: None, lambda ctx: "")
+
+def sub_branch(name, ctx):
+    return SplitterNode(name, lambda ctx: ["leaf"], leaf)
+
+def build_graph():
+    return [SplitterNode("outer", lambda ctx: ["inner"], sub_branch)]
+''', encoding="utf-8")
+        snapshot = build_town_snapshot(workflow_path=workflow)
+        self.assertIsNone(snapshot["warning"])
+        outer, = snapshot["nodes"]
+        inner, = outer["children"]
+        leaf, = inner["children"]
+        self.assertEqual((outer["node_type"], inner["node_type"]), ("splitter", "splitter"))
+        self.assertEqual(leaf["path"], "outer/inner/leaf")
 
     def test_newest_subtask_question_and_outer_packet_precedence(self):
         self.paused({"title": "Runtime review"})
