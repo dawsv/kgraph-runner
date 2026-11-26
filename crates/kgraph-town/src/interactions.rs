@@ -2229,7 +2229,12 @@ mod tests {
         write_json(&r.packet, &revised, true).unwrap();
         let future =
             output.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(2);
-        File::open(&r.packet).unwrap().set_modified(future).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&r.packet)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
         assert!(extract(&revised).get("submitted").is_none());
         assert_eq!(r.submit(payload.clone()).0, 409);
         for raw in [
@@ -2498,7 +2503,10 @@ mod tests {
         let (code, card) = read_run_qa(a_run, true);
         assert_eq!(code, 200, "{card}");
         assert_eq!(card["available"], true);
-        assert_eq!(card["checklist_path"], "a_state_qa/manual_qa.json");
+        assert_eq!(
+            card["checklist_path"],
+            json!(Path::new("a_state_qa").join("manual_qa.json"))
+        );
         let (code, result) = submit_run_qa(
             a_run,
             &json!({"case_id":"check","manual_qa":"pass","tester":"Reviewer"}),

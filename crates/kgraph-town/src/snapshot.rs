@@ -1452,7 +1452,9 @@ mod tests {
             true,
         )
         .unwrap();
-        fs::File::open(&state)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&state)
             .unwrap()
             .set_modified(old.modified().unwrap())
             .unwrap();
