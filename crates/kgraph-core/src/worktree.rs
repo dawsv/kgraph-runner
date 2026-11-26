@@ -64,6 +64,12 @@ fn git_arg(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
+fn canonical(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize()
+        .map(|p| git_arg(&p))
+        .map_err(|e| e.to_string())
+}
+
 fn git(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(git_arg(dir))
@@ -161,15 +167,9 @@ fn lock_file(common: &Path, role: &str, path: &Path) -> Result<File, String> {
 // Git deletes this private directory with the registration. A manually recreated
 // worktree at the same checkout path therefore cannot inherit an old marker.
 fn marker_path(path: &Path, common: &Path) -> Result<PathBuf, String> {
-    let admin = git_path(path, &["rev-parse", "--absolute-git-dir"])?
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+    let admin = canonical(&git_path(path, &["rev-parse", "--absolute-git-dir"])?)?;
     if admin.parent() != Some(common.join("worktrees").as_path())
-        || admin
-            .join(git_path_from_file(&admin.join("gitdir"))?)
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            != path.join(".git")
+        || canonical(&admin.join(git_path_from_file(&admin.join("gitdir"))?))? != path.join(".git")
     {
         return Err(format!(
             "unexpected Git registration for {}",
@@ -219,25 +219,19 @@ pub struct IsolatedWorktree {
 
 impl IsolatedWorktree {
     pub fn create(mut spec: WorktreeSpec) -> Result<Self, String> {
-        let root = spec.repo_root.canonicalize().map_err(|e| e.to_string())?;
-        if git_path(&root, &["rev-parse", "--show-toplevel"])?
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            != root
-        {
+        let root = canonical(&spec.repo_root)?;
+        if canonical(&git_path(&root, &["rev-parse", "--show-toplevel"])?)? != root {
             return Err("repo_root must be the Git worktree root".into());
         }
         let base_commit = commit(&root, spec.base_ref.as_deref().unwrap_or("HEAD"))?;
-        let common = git_path(
+        let common = canonical(&git_path(
             &root,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )?
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+        )?)?;
         let base = root.join(&spec.worktree_base);
         fs::create_dir_all(&base).map_err(|e| e.to_string())?;
         let name = slug(&spec.node_path);
-        let path = base.canonicalize().map_err(|e| e.to_string())?.join(&name);
+        let path = canonical(&base)?.join(&name);
         if root.starts_with(&path) || path.starts_with(&common) || path.is_symlink() {
             return Err(format!("unsafe worktree path {}", path.display()));
         }
@@ -279,7 +273,7 @@ impl IsolatedWorktree {
             .filter_map(|line| line.strip_prefix(b"worktree "))
             .any(|p| {
                 let registered = os_path(p);
-                registered == path || registered.canonicalize().is_ok_and(|p| p == path)
+                registered == path || canonical(&registered).is_ok_and(|p| p == path)
             });
         if registered {
             require_owner(&root, &path, &common, &spec.node_path)?;
@@ -368,7 +362,7 @@ impl IsolatedWorktree {
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or(Path::new("."));
                 fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+                let parent = canonical(parent)?;
                 if parent.starts_with(&self.path) {
                     return Err("export patches outside the disposable worktree".into());
                 }
