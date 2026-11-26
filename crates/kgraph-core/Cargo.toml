@@ -1,0 +1,23 @@
+[package]
+name = "kgraph-core"
+version.workspace = true
+edition.workspace = true
+description = "Core DAG workflow runner, parallel SHA-256 hashing, shell streaming, media verifiers, and QA metrics."
+
+[dependencies]
+chrono.workspace = true
+flate2.workspace = true
+fs2.workspace = true
+globset.workspace = true
+hex.workspace = true
+libc.workspace = true
+once_cell.workspace = true
+png.workspace = true
+rayon.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true

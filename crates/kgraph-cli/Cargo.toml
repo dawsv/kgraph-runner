@@ -1,0 +1,29 @@
+[package]
+name = "kgraph-cli"
+version.workspace = true
+edition.workspace = true
+description = "Standalone native CLI binaries (kgraph and kgraph-town) for KGraph Runner."
+
+[[bin]]
+name = "kgraph"
+path = "src/main.rs"
+
+[[bin]]
+name = "kgraph-town"
+path = "src/bin/kgraph-town.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+kgraph-core.workspace = true
+kgraph-subgraphs.workspace = true
+kgraph-town.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

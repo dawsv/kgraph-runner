@@ -1,18 +1,44 @@
 # KGraph Runner
 
-A Python runner for verified workflows. KGraph schedules DAG nodes as their dependencies finish, with optional parallel execution, nested subgraphs, verified output caching, and bounded repair loops. It has no runtime dependencies beyond Python 3.9 or later. The K is for Kippy.
+KGraph runs verified workflows with parallel DAG scheduling, nested subgraphs, output caching, and bounded repair loops. Use the native Rust binaries for declarative TOML or JSON workflows, or the Python v0.2.0 reference package for workflows defined in Python. Both produce run data for Hero Town. The K is for Kippy.
 
 ## Install
 
-Install v0.2.0 in editable mode from this checkout. Pin a release version in each consuming project's dependencies.
+From this checkout, install the native `kgraph` and `kgraph-town` binaries with stable Rust and Cargo.
+
+```sh
+cargo install --path crates/kgraph-cli
+```
+
+For Python workflows, install the v0.2.0 reference package in a Python 3.9+ virtual environment. It uses only the standard library at runtime.
 
 ```sh
 python -m pip install -e .
 ```
 
+Both installations supply the same command names. To select Python explicitly, use `python -m kgraph_runner.cli` in the environment where you installed it.
+
 ## Run a workflow
 
-Define the steps, their dependencies, and the checks for your project. Each node's input hash should cover the inputs that determine its output, including relevant files and configuration.
+**Native Rust.** Save this task as `workflow.toml` and run it from that directory. It verifies Cargo's output and records a run in `.kgraph/`.
+
+```toml
+[[nodes]]
+id = "toolchain"
+type = "shell"
+command = ["cargo", "--version"]
+expect_stdout_regex = "^cargo "
+```
+
+```sh
+kgraph plan workflow.toml
+kgraph run workflow.toml
+kgraph-town ui workflow.toml
+```
+
+The [native runner guide](docs/rust-runner.md) covers the Rust workspace, workflow schema, built-in presets, and CLI compatibility.
+
+**Python.** Define the steps, their dependencies, and the checks for your project. Each node's input hash should cover the inputs that determine its output, including relevant files and configuration.
 
 ```python
 from pathlib import Path
@@ -61,6 +87,16 @@ See the [bug-fixing subgraph handoff](docs/bug-fixing-subgraph-handoff.md) for r
 See the [Hero Town handoff](docs/hero-town-interactive-subgraph-handoff.md) for examples.
 
 ## Test
+
+From the workspace root, check Rust and build the native release binaries.
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release --workspace
+```
+
+With the Python package installed, run its reference suite.
 
 ```sh
 python -m unittest discover -s tests -v

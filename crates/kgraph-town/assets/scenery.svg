@@ -1,0 +1,62 @@
+
+<svg class="scenery" viewBox="0 0 1440 620" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="var(--sky-top)"/><stop offset="1" stop-color="var(--sky-bottom)"/>
+    </linearGradient>
+    <pattern id="sky-dots" width="13" height="13" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#fff" opacity=".28"/>
+    </pattern>
+    <pattern id="tower-windows" width="27" height="30" patternUnits="userSpaceOnUse">
+      <rect x="9" y="7" width="9" height="12" rx="1.5" fill="var(--sky-bottom)" opacity=".58"/>
+    </pattern>
+    <path id="cloud" d="M3 49C2 35 16 26 27 30 23 7 54-7 70 12 81-3 109 2 115 22 134 11 153 28 150 42 177 38 177 64 154 64H26C10 64 3 59 3 49Z"/>
+    <g id="tree">
+      <path d="M25 36h9v51h-9z" fill="#ab6645" stroke="#172033" stroke-width="2.5"/>
+      <path d="M14 64C1 61-2 45 6 37c-1-17 11-25 20-25 17 0 25 10 25 23 12 13 5 31-11 32Z" fill="#35bc75" stroke="#172033" stroke-width="2.5"/>
+      <path d="M13 42c-4-11 5-22 13-22" fill="none" stroke="#a5e795" stroke-width="4" stroke-linecap="round"/>
+    </g>
+    <g id="lamp" stroke="#172033" stroke-width="2.5" stroke-linejoin="round">
+      <path d="M11 88h10V21q0-10 10-10h8V4h-8Q11 4 11 21z" fill="#2ba7a2"/>
+      <path d="M31 8h18l7 12H29z" fill="#defcf6"/>
+      <path d="M30 20h25v5H30z" fill="#fff0a1"/>
+    </g>
+    <g id="crosswalk" fill="#fff4de">
+      <path d="M0 0h14l-12 56h-18zm26 0h14l-9 56H13zm26 0h14l-5 56H43zm26 0h14l-2 56H72zm26 0h14l3 56h-18z"/>
+    </g>
+  </defs>
+  <path d="M0 0h1440v620H0z" fill="url(#sky)"/>
+  <path d="M0 0h1440v302H0z" fill="url(#sky-dots)"/>
+  <circle cx="1121" cy="99" r="52" fill="var(--sun)" opacity=".22"/>
+  <circle cx="1121" cy="99" r="39" fill="var(--sun)"/>
+  <path class="sun-rays" d="M1121 33V22m0 154v-11m-66-66h-11m154 0h-11m-113-47-8-8m110 110-8-8m0-94 8-8m-110 110 8-8"
+    fill="none" stroke="var(--sun)" stroke-width="4" stroke-linecap="round"/>
+  <path class="stars" fill="#fff3c2" d="M314 80l3 8 8 3-8 3-3 8-3-8-8-3 8-3zm391 29 2 6 6 2-6 2-2 6-2-6-6-2 6-2zm225-57 3 8 8 3-8 3-3 8-3-8-8-3 8-3zm349 98 3 8 8 3-8 3-3 8-3-8-8-3 8-3z"/>
+  <g fill="var(--cloud)">
+    <use href="#cloud" transform="translate(74 100) scale(1.23)"/>
+    <use href="#cloud" transform="translate(434 53) scale(.83)"/>
+    <use href="#cloud" transform="translate(775 117) scale(1.25)"/>
+    <use href="#cloud" transform="translate(1242 53) scale(.9)"/>
+    <use href="#cloud" transform="translate(220 227) scale(.78)" opacity=".61"/>
+    <use href="#cloud" transform="translate(1065 220) scale(.91)" opacity=".68"/>
+  </g>
+  <path d="M0 468h44V354h38v-47h46v38h43v123h44V389h61v-56h50v-43h48v49h31v129h35V402h63v-42h43v-66h39v66h38v108h48v-63h57v-63h74v-31h48v157h32V365h61v-84h46v50h41v137h41V390h35v-48h56v-48h51v76h38v98h33V360h43v-36h47v49h46v173H0z"
+    fill="var(--skyline-far)"/>
+  <path d="M0 500h20V427h50v-28h50v-18h57v119h52V432h52v-24h62v92h49v-67h48v-36h62v103h55v-54h51v-29h66v83h72v-96h47v-23h64v119h62v-79h90v79h38V404h57v-42h60v138h38v-62h87v62h38V417h58v-33h49v116h16v56H0z"
+    fill="var(--skyline)"/>
+  <path d="M0 500h20V427h50v-28h50v-18h57v119h52V432h52v-24h62v92h49v-67h48v-36h62v103h55v-54h51v-29h66v83h72v-96h47v-23h64v119h62v-79h90v79h38V404h57v-42h60v138h38v-62h87v62h38V417h58v-33h49v116h16v56H0z"
+    fill="url(#tower-windows)"/>
+  <path d="M0 526q80-28 169 0 90-38 180 0 100-31 187 0 107-42 213 0 90-38 180 0 85-38 170 0 85-32 172 0 85-26 169-6v35H0z"
+    fill="var(--horizon)"/>
+  <path d="M0 551h1440v69H0z" fill="var(--road)"/>
+  <path d="M0 546h1440v14H0z" fill="#fce7bd" stroke="#172033" stroke-width="3"/>
+  <path d="M0 572h1440" stroke="#8290a0" stroke-width="2"/>
+  <path d="M0 592h1440" stroke="#ffdc72" stroke-width="3" stroke-dasharray="29 28"/>
+  <use href="#crosswalk" x="258" y="562"/><use href="#crosswalk" x="658" y="562"/><use href="#crosswalk" x="1058" y="562"/>
+  <use href="#tree" x="48" y="462"/><use href="#tree" x="163" y="462"/>
+  <use href="#tree" x="421" y="462"/><use href="#tree" x="545" y="462"/>
+  <use href="#tree" x="796" y="462"/><use href="#tree" x="895" y="462"/>
+  <use href="#tree" x="1188" y="462"/><use href="#tree" x="1348" y="462"/>
+  <use href="#lamp" x="220" y="460"/><use href="#lamp" x="624" y="460"/>
+  <use href="#lamp" x="1024" y="460"/><use href="#lamp" x="1275" y="460"/>
+</svg>
