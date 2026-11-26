@@ -3,16 +3,17 @@ use crate::interactions;
 use crate::network::{
     discover_access_urls, generate_token, with_token, AccessUrl, CloudflareTunnel,
 };
-use crate::registry;
 pub use crate::snapshot::SnapshotProvider;
 use crate::snapshot::{build_town_snapshot_from_graph, disable_responses};
 use crate::ui::{self, RenderTownOptions};
+use crate::{registry, workboard};
 use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
 use axum::Router;
 use futures_util::{stream, StreamExt};
+use kgraph_core::telemetry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -395,6 +396,8 @@ enum Endpoint {
     Events,
     Response,
     Logs,
+    Telemetry,
+    Workboard,
     Qa,
     Respond,
     Ingest,
@@ -409,6 +412,8 @@ fn endpoint(hub: bool, method: &Method, path: &str) -> (Endpoint, Option<String>
         (&Method::GET, "/api/snapshot") => (Snapshot, None),
         (&Method::GET, "/api/runs") => (Runs, None),
         (&Method::GET, "/api/events") => (Events, None),
+        (&Method::GET, "/api/telemetry") if !hub => (Telemetry, None),
+        (&Method::GET, "/api/workboard") if !hub => (Workboard, None),
         (&Method::GET, "/api/logs") if !hub => (Logs, None),
         (&Method::GET | &Method::POST, "/api/qa") if !hub => (Qa, None),
         (&Method::POST, "/api/respond") if !hub => (Respond, None),
@@ -426,6 +431,8 @@ fn endpoint(hub: bool, method: &Method, path: &str) -> (Endpoint, Option<String>
                     (&Method::POST, "delete") => Delete,
                     (&Method::GET, "response") => Response,
                     (&Method::GET, "logs") => Logs,
+                    (&Method::GET, "telemetry") => Telemetry,
+                    (&Method::GET, "workboard") => Workboard,
                     (&Method::GET | &Method::POST, "qa") => Qa,
                     _ => Missing,
                 };
@@ -575,6 +582,8 @@ fn failure(op: Endpoint, mutation: bool) -> Response {
     match op {
         Endpoint::Respond => error(status, "Could not deliver gate response"),
         Endpoint::Qa if mutation => error(status, "Could not record manual QA"),
+        Endpoint::Telemetry => error(status, "Could not read run telemetry"),
+        Endpoint::Workboard => error(status, "Could not read workboard"),
         Endpoint::Delete => error(status, "Could not dismiss run"),
         Endpoint::Ingest => error(status, "Could not store remote snapshot"),
         _ => http_error(status, "Could not build town snapshot"),
@@ -631,6 +640,12 @@ fn execute(
             Some(v) => json_reply(StatusCode::OK, v),
             None => error(StatusCode::NOT_FOUND, "No queued response for this run"),
         },
+        Endpoint::Telemetry | Endpoint::Workboard => {
+            let Some(run) = town.run(id, true)? else {
+                return Ok(not_found());
+            };
+            local_work_data(op, &run, &query)?
+        }
         Endpoint::Logs | Endpoint::Qa | Endpoint::Respond => {
             let Some(run) = town.run(id, op != Endpoint::Respond)? else {
                 return Ok(not_found());
@@ -681,6 +696,105 @@ fn execute(
         }
         Endpoint::Events | Endpoint::Missing => unreachable!(),
     })
+}
+
+fn local_work_data(op: Endpoint, run: &Value, query: &Fields) -> Result<Response, String> {
+    let path = |key: &str| run[key].as_str().filter(|s| !s.is_empty()).map(Path::new);
+    let denied = || {
+        error(
+            StatusCode::FORBIDDEN,
+            "This operation requires a local run inside .kgraph",
+        )
+    };
+    let Some(state) = path("state_path") else {
+        return Ok(denied());
+    };
+    // A remote entry can retain local metadata when ingestion deduplicates
+    // against a run registered on this host. A foreign state path is untrusted.
+    if run["source"] == "remote"
+        && (path("report_path").is_none()
+            || !state.is_file()
+            || run["source_host"]
+                .as_str()
+                .is_some_and(|h| h.to_lowercase() != registry::hostname()))
+    {
+        return Ok(denied());
+    }
+    let Some(root) = state
+        .ancestors()
+        .skip(1)
+        .find(|p| p.file_name().is_some_and(|n| n == ".kgraph"))
+    else {
+        return Ok(denied());
+    };
+    if interactions::reject_path_traversal(state).is_err() || root.is_symlink() {
+        return Ok(denied());
+    }
+    let root = interactions::resolve(root).map_err(|e| e.to_string())?;
+    let Ok(state) = interactions::ensure_inside(state, &root) else {
+        return Ok(denied());
+    };
+    if op == Endpoint::Workboard {
+        let items = workboard::list_workboard(&state, path("report_path"), path("project_dir"))?;
+        return Ok(json_reply(StatusCode::OK, json!({"items":items})));
+    }
+    let last = match field(query, "last") {
+        None => None,
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                return Ok(error(
+                    StatusCode::BAD_REQUEST,
+                    "last must be a positive integer",
+                ))
+            }
+        },
+    };
+    let history = state.with_file_name("telemetry.jsonl");
+    if interactions::ensure_inside(&history, &root).as_ref() != Ok(&history) {
+        return Ok(denied());
+    }
+    // Anchor the actual read as well as the preflight containment check.
+    let file = match interactions::regular(&history, true) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json_reply(StatusCode::OK, json!({"available":false})));
+        }
+        Err(_) => return Ok(denied()),
+    };
+    let lock = history.with_extension("jsonl.lock");
+    let runs = {
+        let _guard = crate::artifact::lock(&root, &lock).map_err(|e| e.to_string())?;
+        use std::io::{BufRead, BufReader};
+        let mut runs = std::collections::VecDeque::new();
+        let workflow = field(query, "workflow");
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let run: telemetry::RunTelemetry =
+                serde_json::from_str(&line).map_err(|e| e.to_string())?;
+            if workflow.is_some() && workflow != run.workflow_ref.as_deref() {
+                continue;
+            }
+            runs.push_back(run);
+            if last.is_some_and(|limit| runs.len() > limit) {
+                runs.pop_front();
+            }
+        }
+        Vec::from(runs)
+    };
+    let Some(latest) = runs.last() else {
+        return Ok(json_reply(StatusCode::OK, json!({"available":false})));
+    };
+    let result = if field(query, "chrome_trace") == Some("1") {
+        telemetry::export_chrome_trace(latest)
+    } else {
+        json!({"available":true, "runs_analyzed":runs.len(), "latest_run":latest,
+               "analysis":telemetry::analyze_telemetry(&runs)})
+    };
+    Ok(json_reply(StatusCode::OK, result))
 }
 
 fn subscribe(town: &Arc<Town>, selected: String) -> watch::Receiver<Option<Event>> {
@@ -1152,6 +1266,143 @@ mod tests {
             .expect("server shutdown stalled")
             .unwrap();
     }
+    #[tokio::test]
+    async fn telemetry_and_workboard_reads() {
+        use StatusCode as S;
+        let local = Local::new();
+        let packet = local.state.with_file_name("packet.json");
+        write_json(&packet, &json!({"output_path":"result.json"}), false).unwrap();
+        write_json(
+            &local.state,
+            &json!({"nodes":{"work":{"status":"awaiting_subagents","packet_path":packet}}}),
+            false,
+        )
+        .unwrap();
+        let town = start_town_server(local.provider(), config(Some("test"), true))
+            .await
+            .unwrap();
+        let url = base(&town);
+        let c = client();
+        let get = |p: &str| c.get(format!("{url}/api/{p}")).bearer_auth("test");
+        for endpoint in ["telemetry", "workboard"] {
+            checked(c.get(format!("{url}/api/{endpoint}")), S::UNAUTHORIZED).await;
+        }
+        assert_eq!(document(get("telemetry")).await, json!({"available":false}));
+        let history = local.state.with_file_name("telemetry.jsonl");
+        for (id, workflow) in [("one", "alpha"), ("two", "alpha"), ("three", "beta")] {
+            let run = telemetry::RunTelemetry {
+                version: 1,
+                run_id: id.into(),
+                workflow_ref: Some(workflow.into()),
+                ..Default::default()
+            };
+            telemetry::append_run_telemetry(&history, &run).unwrap();
+        }
+        let all = document(get("telemetry")).await;
+        assert_eq!(all["available"], true);
+        assert_eq!(all["runs_analyzed"], 3);
+        assert_eq!(all["latest_run"]["run_id"], "three");
+        assert!(all["analysis"].is_object());
+        let filtered = document(get("telemetry?last=1&workflow=alpha")).await;
+        assert_eq!(filtered["runs_analyzed"], 1);
+        assert_eq!(filtered["latest_run"]["run_id"], "two");
+        assert_eq!(
+            document(get("telemetry?workflow=missing")).await,
+            json!({"available":false})
+        );
+        let trace = document(get("telemetry?chrome_trace=1")).await;
+        assert!(trace["traceEvents"].is_array());
+        assert!(trace.get("analysis").is_none());
+        for query in ["last=0", "last=no"] {
+            checked(get(&format!("telemetry?{query}")), S::BAD_REQUEST).await;
+        }
+        assert!(document(get("workboard")).await["items"][0]["lease"].is_null());
+        workboard::claim_work(
+            &local.state,
+            Some(&local.report),
+            None,
+            "agent",
+            60,
+            None,
+            None,
+        )
+        .unwrap();
+        let board = document(get("workboard")).await;
+        assert_eq!(board["items"][0]["lease"]["worker_id"], "agent");
+        assert_eq!(
+            board["items"][0]["expected_outputs"],
+            json!(["result.json"])
+        );
+        #[cfg(unix)]
+        {
+            let outside = local._temp.path().join("private.jsonl");
+            std::fs::rename(&history, &outside).unwrap();
+            std::os::unix::fs::symlink(&outside, &history).unwrap();
+            checked(get("telemetry"), S::FORBIDDEN).await;
+        }
+        stop(town).await;
+    }
+
+    #[tokio::test]
+    async fn hub_work_data_requires_registered_local_run() {
+        // Confine ingestion and registry writes to an isolated test process.
+        const CHILD: &str = "KGRAPH_WORK_DATA_HUB_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = spawn_blocking(|| {
+                let home = tempdir().unwrap();
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "server::tests::hub_work_data_requires_registered_local_run",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env("KGRAPH_HOME", home.path())
+                    .output()
+                    .unwrap()
+            })
+            .await
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let local = Local::new();
+        let project = local.state.parent().unwrap().parent().unwrap().to_owned();
+        let hub = start_hub_server(vec![project], config(Some("test"), true))
+            .await
+            .unwrap();
+        let c = client();
+        let url = base(&hub);
+        let get = |p: &str| c.get(format!("{url}/api/runs{p}")).bearer_auth("test");
+        let runs = document(get("")).await;
+        let id = runs["runs"][0]["id"].as_str().unwrap();
+        let remote = json!({"run":{"run_id":"foreign","source_host":"other-host"},"snapshot":local.provider()().unwrap()});
+        document(
+            c.post(format!("{url}/api/ingest"))
+                .bearer_auth("test")
+                .json(&remote),
+        )
+        .await;
+        for op in ["telemetry", "workboard"] {
+            checked(get(&format!("/missing/{op}")), StatusCode::NOT_FOUND).await;
+            checked(get(&format!("/foreign/{op}")), StatusCode::FORBIDDEN).await;
+        }
+        assert_eq!(
+            document(get(&format!("/{id}/telemetry"))).await,
+            json!({"available":false})
+        );
+        assert_eq!(
+            document(get(&format!("/{id}/workboard"))).await,
+            json!({"items":[]})
+        );
+        stop(hub).await;
+    }
+
     async fn raw(port: u16, method: &str, path: &str, headers: &str, body: &[u8]) -> String {
         let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let mut request = format!(

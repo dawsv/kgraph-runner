@@ -90,6 +90,49 @@ impl fmt::Display for TaskKind {
     }
 }
 
+/// Token, model, and cost telemetry emitted by agent/LLM worker nodes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Non-cached input. Parsers split inclusive OpenAI input counts from cache hits.
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub tool_calls: u64,
+}
+
+impl AgentUsage {
+    /// Counts each non-cached input, cached input, and output token exactly once.
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cached_tokens)
+    }
+
+    pub fn add_assign(&mut self, other: &AgentUsage) {
+        if self.provider.is_none() {
+            self.provider = other.provider.clone();
+        }
+        if self.model.is_none() {
+            self.model = other.model.clone();
+        }
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(other.cached_tokens);
+        self.cost_usd += other.cost_usd;
+        self.tool_calls = self.tool_calls.saturating_add(other.tool_calls);
+    }
+}
+
 /// Efficiency telemetry counters tracked on `GraphFailure` and `GraphRunner`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EfficiencyCounts {

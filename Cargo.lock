@@ -893,13 +893,14 @@ dependencies = [
 
 [[package]]
 name = "kgraph-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
  "kgraph-core",
  "kgraph-subgraphs",
  "kgraph-town",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -911,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "kgraph-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "flate2",
@@ -933,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "kgraph-subgraphs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "kgraph-core",
@@ -950,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "kgraph-town"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

@@ -206,6 +206,10 @@ fn update_fields(update: &Update) -> Value {
     v
 }
 pub fn progress(p: Progress) -> Result<i32> {
+    let data = progress_data(&p)?;
+    finish_update(p.update, data)
+}
+pub fn progress_data(p: &Progress) -> Result<Value> {
     if p.progress.is_some_and(|v| !v.is_finite()) {
         return Err("Progress must be a number from 0 to 100".into());
     }
@@ -223,31 +227,33 @@ pub fn progress(p: Progress) -> Result<i32> {
         fields["outputs"] = json!(p.output);
     }
     fields.as_object_mut().unwrap().retain(|_, v| !v.is_null());
-    let data = live::update_node_progress(
+    live::update_node_progress(
         &p.update.state,
         &p.update.node,
         p.item.as_deref(),
         &fields,
         p.clear,
-    )?;
-    finish_update(p.update, data)
+    )
 }
 pub fn ask(a: Ask) -> Result<i32> {
+    let data = ask_data(&a)?;
+    finish_update(a.update, data)
+}
+pub fn ask_data(a: &Ask) -> Result<Value> {
     let mut fields = update_fields(&a.update);
     fields["question"] = json!(a.question);
-    if let Some(source) = a.questions_json {
+    if let Some(source) = &a.questions_json {
         let raw = if source.trim_start().starts_with(['[', '{']) {
-            source
+            source.clone()
         } else {
-            fs::read_to_string(&source).map_err(|e| format!("{source}: {e}"))?
+            fs::read_to_string(source).map_err(|e| format!("{source}: {e}"))?
         };
         fields["questions"] = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     }
     fields["multi_select"] = json!(a.multi_select);
     fields["allow_note"] = json!(!a.no_note);
     fields["agent"] = json!(a.agent);
-    let data = live::ask_node_question(&a.update.state, &a.update.node, &a.item, &fields)?;
-    finish_update(a.update, data)
+    live::ask_node_question(&a.update.state, &a.update.node, &a.item, &fields)
 }
 fn finish_update(update: Update, data: Value) -> Result<i32> {
     if update.push || update.hub_url.is_some() {

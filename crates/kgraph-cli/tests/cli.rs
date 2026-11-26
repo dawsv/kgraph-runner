@@ -1,6 +1,8 @@
 #[path = "support/hub.rs"]
 mod hub;
 mod support;
+#[path = "support/wave9.rs"]
+mod wave9;
 use serde_json::{json, Value};
 use std::{
     fs,

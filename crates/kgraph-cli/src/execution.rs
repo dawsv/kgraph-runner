@@ -32,12 +32,15 @@ fn config(args: &Execution) -> RunnerConfig {
         ..Default::default()
     }
 }
-pub fn plan(args: Execution, json: bool) -> Result<i32> {
+pub fn plan_entries(args: Execution) -> Result<Vec<kgraph_core::types::PlanEntry>> {
     let flow = load(&resolve(&args.workflow)?, &args.definition)?;
     let runner = GraphRunner::new(config(&args))?;
-    let entries = runner
+    runner
         .plan(&flow.nodes, &flow.context, "")
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+pub fn plan(args: Execution, json: bool) -> Result<i32> {
+    let entries = plan_entries(args)?;
     if json {
         return print_json(&entries);
     }
@@ -64,6 +67,7 @@ struct RunFiles {
     report: PathBuf,
     project: PathBuf,
     factory: String,
+    telemetry: Option<PathBuf>,
 }
 impl RunFiles {
     fn register(&self, status: &str, expected: Option<&str>) -> Option<Value> {
@@ -234,6 +238,7 @@ fn once(
     wakeups: &Wakeups,
     previous: usize,
 ) -> Result<Iteration> {
+    let began = chrono::Utc::now();
     let started = paths.register("running", None);
     let expected = started.as_ref().and_then(|v| v["updated_at"].as_str());
     if let (Some(hub), Some(id)) = (hub, started.as_ref().and_then(|v| v["id"].as_str())) {
@@ -295,6 +300,23 @@ fn once(
     }
     let flow = loaded.as_ref().ok().map(Arc::as_ref);
     let status = result.status(&runner);
+    // Append here so the workflow reference never overrides a user's workflow context.
+    // This also records load failures which do not reach GraphRunner::run.
+    if let Some(path) = &paths.telemetry {
+        let reference = paths.workflow.to_string_lossy();
+        let mut run = runner.build_run_telemetry(status, result.code, Some(&reference));
+        if run.run_id.is_empty() {
+            let end = chrono::Utc::now();
+            run.started_at = began.to_rfc3339();
+            run.finished_at = end.to_rfc3339();
+            run.run_id = format!("{}-{}", run.started_at, std::process::id());
+            run.wall_time_ms = (end - began).num_microseconds().unwrap_or(0) as f64 / 1000.0;
+            run.state_path = paths.state.display().to_string();
+        }
+        if let Err(error) = kgraph_core::telemetry::append_run_telemetry(path, &run) {
+            eprintln!("kgraph-town: could not record telemetry: {error}");
+        }
+    }
     if !result.error.is_empty() {
         eprintln!("kgraph-town: {status}: {}", result.error);
     }
@@ -335,6 +357,21 @@ fn once(
     })
 }
 
+// Callers resolve both paths first so aliases also compare equal before creation.
+fn same_file_identity(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (a.metadata(), b.metadata()) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    false
+}
+
 pub fn run(args: Run) -> Result<i32> {
     let workflow = resolve(&args.execution.workflow)?;
     let state = config(&args.execution).state_path;
@@ -343,10 +380,31 @@ pub fn run(args: Run) -> Result<i32> {
         .clone()
         .unwrap_or_else(|| default_file(&args.execution.workflow, "_report.json"));
     let dest = resolve(&report)?;
-    if dest == workflow || dest == resolve(&state)? {
+    let state_dest = resolve(&state)?;
+    if same_file_identity(&state_dest, &workflow) {
+        return Err("--state must be separate from the workflow file".into());
+    }
+    if same_file_identity(&dest, &workflow) || same_file_identity(&dest, &state_dest) {
         return Err("--report must be separate from the state and workflow files".into());
     }
+    let telemetry = if args.no_telemetry {
+        None
+    } else {
+        let ledger = args
+            .telemetry
+            .clone()
+            .unwrap_or_else(|| state.with_file_name("telemetry.jsonl"));
+        let target = resolve(&ledger)?;
+        if [&workflow, &state_dest, &dest]
+            .into_iter()
+            .any(|path| same_file_identity(&target, path))
+        {
+            return Err("--telemetry must be separate from the workflow, state, and report".into());
+        }
+        Some(ledger)
+    };
     let paths = RunFiles {
+        telemetry,
         workflow,
         state,
         report,

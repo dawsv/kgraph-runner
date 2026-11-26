@@ -2,7 +2,7 @@
 use serde_json::Value;
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -84,7 +84,7 @@ mod platform {
         Ok(parent)
     }
 
-    fn output_parent(root: &Path, path: &Path) -> io::Result<(File, CString)> {
+    fn parent_at(root: &Path, path: &Path, create: bool) -> io::Result<(File, CString)> {
         let relative = path.strip_prefix(root).map_err(|_| denied())?;
         let name = CString::new(relative.file_name().ok_or_else(denied)?.as_bytes())?;
         let mut parent = open_absolute(root, true)?;
@@ -94,7 +94,7 @@ mod platform {
             };
             let part = CString::new(part.as_bytes())?;
             parent = match open_at(&parent, &part, DIRECTORY) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(e) if create && e.kind() == io::ErrorKind::NotFound => {
                     if unsafe { libc::mkdirat(parent.as_raw_fd(), part.as_ptr(), 0o755) } < 0 {
                         let e = io::Error::last_os_error();
                         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -109,8 +109,13 @@ mod platform {
         Ok((parent, name))
     }
 
+    pub(super) fn open_inside(root: &Path, path: &Path) -> io::Result<File> {
+        let (parent, name) = parent_at(root, path, false)?;
+        open_at(&parent, &name, libc::O_RDONLY)
+    }
+
     pub(crate) fn lock(root: &Path, path: &Path) -> io::Result<File> {
-        let (parent, name) = output_parent(root, path)?;
+        let (parent, name) = parent_at(root, path, true)?;
         let file = open_at(&parent, &name, libc::O_CREAT | libc::O_RDWR)?;
         if !file.metadata()?.is_file() {
             return Err(denied());
@@ -120,7 +125,7 @@ mod platform {
     }
 
     pub(crate) fn write(root: &Path, path: &Path, doc: &Value) -> io::Result<()> {
-        let (parent, target) = output_parent(root, path)?;
+        let (parent, target) = parent_at(root, path, true)?;
         let dir = parent.as_raw_fd();
         let temp = CString::new(format!(".kgraph-{:032x}.tmp", rand::random::<u128>()))?;
         let mut file = open_at(
@@ -176,6 +181,11 @@ mod platform {
         Ok(())
     }
 
+    pub(super) fn open_inside(root: &Path, path: &Path) -> io::Result<File> {
+        check(root, path)?;
+        File::open(path)
+    }
+
     pub(crate) fn lock(root: &Path, path: &Path) -> io::Result<File> {
         check(root, path)?;
         let file = OpenOptions::new()
@@ -217,3 +227,28 @@ mod platform {
 #[cfg(unix)]
 pub(crate) use platform::open_absolute;
 pub(crate) use platform::{lock, write};
+
+pub(crate) fn read_json_inside(root: &Path, target: &Path, limit: usize) -> io::Result<Value> {
+    let file = platform::open_inside(root, target)?;
+    // File::metadata checks the opened descriptor, including its file type.
+    if !file.metadata()?.is_file() {
+        return Err(denied());
+    }
+    let mut bytes = Vec::new();
+    file.take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "JSON file exceeds the size limit",
+        ));
+    }
+    let packet: Value = serde_json::from_slice(&bytes)?;
+    if !packet.is_object() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Expected a JSON object",
+        ));
+    }
+    Ok(packet)
+}

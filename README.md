@@ -36,7 +36,12 @@ kgraph run workflow.toml
 kgraph-town ui workflow.toml
 ```
 
-The [native runner guide](docs/rust-runner.md) covers the Rust workspace, workflow schema, built-in presets, and CLI compatibility.
+**Native v0.3.0 workflows**
+
+- Find slow or unreliable nodes with `kgraph analyze`. Each run records timings, cache decisions, lock waits, and reported agent usage. [Telemetry and trace exports](docs/rust-runner.md#execution-telemetry)
+- Run Codex, Claude, Agy, or a custom worker in an `agent` node. Verify its output, request an evaluator critique, and retry with evidence from the failed attempt. [Agent workflows](docs/rust-runner.md#agent-nodes-and-evaluator-retries)
+- Validate JSON outputs, pass verified values to dependent nodes, and reduce parallel results in input order. Isolate workers in Git worktrees when they write to the same paths. [Contracts and splitters](docs/rust-runner.md#typed-outputs-and-parallel-reduction)
+- Start with `kgraph init`, let workers claim waiting packets with expiring leases, or connect a `/goal` client to the 13 tools served by `kgraph mcp`. [Templates, workboard, and MCP](docs/rust-runner.md#templates-workboard-and-mcp)
 
 **Python.** Define the steps, their dependencies, and the checks for your project. Each node's input hash should cover the inputs that determine its output, including relevant files and configuration.
 

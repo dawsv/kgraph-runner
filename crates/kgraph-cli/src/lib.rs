@@ -1,9 +1,13 @@
 //! Command-line entry points shared by the native kgraph and kgraph-town binaries.
+mod analyze;
 mod args;
 mod display;
 mod execution;
+mod init;
+pub mod mcp;
 mod publisher;
 mod response;
+mod swarm;
 mod town;
 mod watch;
 
@@ -51,6 +55,25 @@ fn dispatch(cmd: Command) -> Result<i32> {
     match cmd {
         Command::Run(args) => execution::run(args),
         Command::Plan { execution, json } => execution::plan(execution, json),
+        Command::Analyze(args) => analyze::display(args),
+        Command::Workboard(args) => swarm::display_board(args),
+        Command::Claim(args) => swarm::display_claim(args),
+        Command::Heartbeat { lease, ttl } => {
+            swarm::display_lease(&lease, swarm::heartbeat(&lease, ttl)?)
+        }
+        Command::Release { lease, reason } => {
+            swarm::display_lease(&lease, swarm::release(&lease, reason.as_deref())?)
+        }
+        Command::Complete { lease, summary } => {
+            swarm::display_lease(&lease, swarm::complete(&lease, summary.as_deref())?)
+        }
+        Command::Mcp { once } => mcp::serve(once),
+        Command::Init {
+            template,
+            output,
+            dir,
+            force,
+        } => init::scaffold(template, &output, &dir, force),
         Command::Status { state, json } => display::status(&state, json),
         Command::Report { report, json } => display::report(&report, json),
         Command::Qa { action } => display::qa(action),

@@ -21,6 +21,52 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Analyze the telemetry ledger across workflow runs.
+    #[command(visible_alias = "telemetry")]
+    Analyze(Analyze),
+    /// List waiting packets and active leases.
+    Workboard(Board),
+    /// Claim a waiting packet.
+    Claim(Claim),
+    /// Extend a worker's lease.
+    Heartbeat {
+        #[command(flatten)]
+        lease: Lease,
+        #[arg(long, default_value_t = 300)]
+        ttl: u64,
+    },
+    /// Return a leased packet to the workboard.
+    Release {
+        #[command(flatten)]
+        lease: Lease,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Complete a lease and record Hero Town progress.
+    Complete {
+        #[command(flatten)]
+        lease: Lease,
+        #[arg(long)]
+        summary: Option<String>,
+    },
+    /// Serve MCP tools over standard input and output.
+    Mcp {
+        // Internal worker for workflow commands which inherit standard input.
+        #[arg(long, hide = true)]
+        once: bool,
+    },
+    /// Scaffold a declarative workflow for a workspace.
+    Init {
+        #[arg(value_enum, default_value = "ci")]
+        template: Template,
+        /// Workflow path, relative to --dir unless absolute.
+        #[arg(long, default_value = ".kgraph/workflow.toml")]
+        output: PathBuf,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
     /// Record manual QA and review quality metrics.
     Qa {
         #[command(subcommand)]
@@ -141,6 +187,10 @@ pub struct Execution {
 
 #[derive(Args)]
 pub struct Run {
+    #[arg(long, conflicts_with = "no_telemetry")]
+    pub telemetry: Option<PathBuf>,
+    #[arg(long)]
+    pub no_telemetry: bool,
     #[command(flatten)]
     pub execution: Execution,
     #[arg(long)]
@@ -367,4 +417,61 @@ pub enum Qa {
         md_out: Option<PathBuf>,
     },
     History(History),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+pub enum Template {
+    Ci,
+    AgentLoop,
+    SwarmSplitter,
+    BugFix,
+    BugBatch,
+    Release,
+}
+
+#[derive(Args)]
+pub struct Analyze {
+    #[arg(default_value = ".kgraph/telemetry.jsonl")]
+    pub telemetry_path: PathBuf,
+    #[arg(long)]
+    pub workflow: Option<String>,
+    #[arg(long)]
+    pub last: Option<usize>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub md_out: Option<PathBuf>,
+    #[arg(long)]
+    pub chrome_trace: Option<PathBuf>,
+}
+#[derive(Args)]
+pub struct Board {
+    pub state: PathBuf,
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+}
+#[derive(Args)]
+pub struct Claim {
+    #[command(flatten)]
+    pub board: Board,
+    #[arg(long)]
+    pub worker: String,
+    #[arg(long)]
+    pub node: Option<String>,
+    #[arg(long, default_value_t = 300)]
+    pub ttl: u64,
+    #[arg(long)]
+    pub worktree: Option<PathBuf>,
+}
+#[derive(Args)]
+pub struct Lease {
+    pub state: PathBuf,
+    #[arg(long)]
+    pub node: String,
+    #[arg(long)]
+    pub worker: String,
+    #[arg(long)]
+    pub json: bool,
 }

@@ -843,7 +843,7 @@ fn build(
             v
         })
         .collect::<Vec<_>>();
-    json!({
+    let mut snapshot = json!({
         "version": 1,
         "title": title,
         "status": status,
@@ -861,7 +861,18 @@ fn build(
         "report_file": report,
         "generated_at": live::now(),
         "warning": (!warnings.is_empty()).then(||warnings.join(" • ")),
-    })
+    });
+    if overview["telemetry_summary"].is_object() {
+        snapshot["telemetry_summary"] = overview["telemetry_summary"].clone();
+    }
+    if let Some(state) = state {
+        watch(&crate::workboard::leases_path_for_state(state));
+        let leases = crate::workboard::read_active_leases(state);
+        if !leases.is_empty() {
+            snapshot["leases"] = json!(leases);
+        }
+    }
+    snapshot
 }
 pub fn build_town_snapshot_from_graph(
     workflow_ref: Option<&Path>,
@@ -1054,7 +1065,13 @@ pub fn cached_town_snapshot(
             && cache.watched.iter().all(|(p, s)| signature(p) == *s)
         {
             if let Some(s) = &cache.snapshot {
-                return Ok(s.clone());
+                let now = Utc::now();
+                if array(&s["leases"])
+                    .iter()
+                    .all(|l| stamp(&l["expires_at"]) > now)
+                {
+                    return Ok(s.clone());
+                }
             }
         }
         if cache.graph_key.as_ref() != Some(&graph_key) {

@@ -1,7 +1,11 @@
 //! Dependency-ordered workflow execution, artifact caching, and run telemetry.
 #![allow(clippy::result_large_err)] // The public API returns a structured GraphFailure by value.
 
-use crate::{files, hash, types::*};
+use crate::{
+    files, hash,
+    telemetry::{self, AttemptUsage, NodeTelemetry, ResourceWait, RunTelemetry},
+    types::*,
+};
 use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
 use std::{
@@ -16,6 +20,8 @@ use std::{
 #[derive(Clone)]
 pub struct RunnerConfig {
     pub state_path: PathBuf,
+    /// Append one version-1 JSONL record per completed run. Defaults to in-memory telemetry.
+    pub telemetry_path: Option<PathBuf>,
     pub retry_nodes: HashSet<String>,
     pub force: bool,
     pub until: Option<String>,
@@ -29,6 +35,7 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             state_path: "graph_state.json".into(),
+            telemetry_path: None,
             retry_nodes: HashSet::new(),
             force: false,
             until: None,
@@ -63,9 +70,96 @@ struct Runtime {
 
 pub struct GraphRunner {
     config: RunnerConfig,
+    last_telemetry: Mutex<RunTelemetry>,
     runtime: Mutex<Runtime>,
     resources: Mutex<HashMap<String, Arc<ResourceLock>>>,
     log_lock: Mutex<()>,
+}
+
+struct RunClock {
+    start: Instant,
+    nodes: Mutex<Vec<NodeTelemetry>>,
+}
+
+#[derive(Clone, Copy)]
+struct NodeScope<'a> {
+    ctx: &'a Context,
+    held: &'a BTreeSet<String>,
+    track_stages: bool,
+    clock: &'a RunClock,
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+thread_local! {
+    static ACTIVE_NODE_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+// Synchronous nested graphs share a thread. Restore the enclosing scope on
+// every exit, including unwinding from a user callback.
+struct NodePathGuard(Option<String>);
+
+impl NodePathGuard {
+    fn enter(path: &str) -> Self {
+        Self(ACTIVE_NODE_PATH.replace(Some(path.to_owned())))
+    }
+}
+
+impl Drop for NodePathGuard {
+    fn drop(&mut self) {
+        ACTIVE_NODE_PATH.set(self.0.take());
+    }
+}
+
+pub(crate) fn active_node_path() -> Option<String> {
+    ACTIVE_NODE_PATH.with_borrow(Clone::clone)
+}
+
+fn git_field(args: &[&str]) -> Option<String> {
+    let result = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .output()
+        .ok()?;
+    result
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&result.stdout).trim().to_string())
+}
+
+fn context_usage(ctx: &Context, path: &str) -> Option<AgentUsage> {
+    let map = ctx.0.read().unwrap_or_else(|e| e.into_inner());
+    let value = map.get("__kgraph_usage")?.get(path)?;
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn usage_increment(
+    previous: Option<&AgentUsage>,
+    current: Option<&AgentUsage>,
+) -> Option<AgentUsage> {
+    let current = current?;
+    if previous == Some(current) {
+        return None;
+    }
+    let mut delta = current.clone();
+    if let Some(prev) = previous.filter(|p| {
+        p.provider == current.provider
+            && p.model == current.model
+            && p.input_tokens <= current.input_tokens
+            && p.output_tokens <= current.output_tokens
+            && p.cached_tokens <= current.cached_tokens
+            && p.tool_calls <= current.tool_calls
+            && p.cost_usd <= current.cost_usd
+    }) {
+        delta.input_tokens -= prev.input_tokens;
+        delta.output_tokens -= prev.output_tokens;
+        delta.cached_tokens -= prev.cached_tokens;
+        delta.tool_calls -= prev.tool_calls;
+        delta.cost_usd -= prev.cost_usd;
+    }
+    Some(delta)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -85,7 +179,7 @@ struct ResourceLock {
 }
 
 impl ResourceLock {
-    fn acquire(&self, blocking: bool) -> bool {
+    fn acquire(&self, blocking: bool, mut on_wait: impl FnMut(Instant, Duration)) -> bool {
         let id = thread::current().id();
         let mut state = lock(&self.state);
         loop {
@@ -105,10 +199,12 @@ impl ResourceLock {
             if !blocking {
                 return false;
             }
+            let wait_start = Instant::now();
             state = self
                 .available
                 .wait(state)
                 .unwrap_or_else(|e| e.into_inner());
+            on_wait(wait_start, wait_start.elapsed());
         }
     }
     fn release(&self) {
@@ -300,6 +396,11 @@ impl GraphRunner {
             ..Default::default()
         };
         Ok(Self {
+            last_telemetry: Mutex::new(RunTelemetry {
+                version: 1,
+                state_path: config.state_path.display().to_string(),
+                ..Default::default()
+            }),
             config,
             runtime: Mutex::new(runtime),
             resources: Default::default(),
@@ -597,39 +698,115 @@ impl GraphRunner {
             rt.reached = None;
             rt.last = None;
         }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let string_field = |key| ctx.get(key).and_then(|v| v.as_str().map(str::to_owned));
+        let git_head =
+            string_field("git_head").or_else(|| git_field(&["rev-parse", "--verify", "HEAD"]));
+        let git_dirty = ctx
+            .get("git_dirty")
+            .and_then(|v| v.as_bool())
+            .or_else(|| git_field(&["status", "--porcelain"]).map(|status| !status.is_empty()));
+        let started_at = now();
+        let clock = RunClock {
+            start: Instant::now(),
+            nodes: Mutex::default(),
+        };
+        let mut run = RunTelemetry {
+            version: 1,
+            run_id: format!(
+                "{}-{:x}-{:x}",
+                started_at,
+                std::process::id(),
+                RUN_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ),
+            workflow_ref: string_field("workflow_ref"),
+            state_path: self.config.state_path.display().to_string(),
+            git_head,
+            git_dirty,
+            started_at,
+            ..Default::default()
+        };
         self.emit("run_start", json!({"status":"running","error":""}));
         let result = self
             .resolve_until(root_nodes, prefix, false)
             .and_then(|until| {
                 lock(&self.runtime).until_path = until;
-                self.run_nodes(root_nodes, ctx, prefix, true, &BTreeSet::new())
+                self.run_nodes(
+                    root_nodes,
+                    prefix,
+                    NodeScope {
+                        ctx,
+                        track_stages: true,
+                        held: &BTreeSet::new(),
+                        clock: &clock,
+                    },
+                    clock.start,
+                )
             });
-        match &result {
-            Err(e) => self.emit("run_end", json!({"status":e.status_str(),"error":e.to_string()})),
-            Ok(()) => self.emit("run_end", json!({"status":if self.reached_path().is_some() {"stopped"} else {"passed"}, "error":""})),
+        let (status, exit_code, error) = match &result {
+            Err(e) => (e.status_str(), e.exit_code(), e.to_string()),
+            Ok(()) if self.reached_path().is_some() => ("stopped", 0, String::new()),
+            Ok(()) => ("passed", 0, String::new()),
+        };
+        run.wall_time_ms = millis(clock.start.elapsed());
+        run.finished_at = now();
+        run.nodes = clock.nodes.into_inner().unwrap_or_else(|e| e.into_inner());
+        run.status = status.into();
+        run.exit_code = exit_code;
+        run.summarize();
+        if let Some(path) = &self.config.telemetry_path {
+            if same_report_target(path, &self.config.state_path) == Ok(false) {
+                let _ = telemetry::append_run_telemetry(path, &run);
+            }
         }
+        *lock(&self.last_telemetry) = run;
+        self.emit("run_end", json!({"status":status,"error":error}));
         result.map(|()| ctx.clone())
+    }
+
+    /// Snapshot the most recently completed run, optionally supplying its workflow reference.
+    pub fn build_run_telemetry(
+        &self,
+        status: &str,
+        exit_code: i32,
+        workflow_ref: Option<&str>,
+    ) -> RunTelemetry {
+        let mut result = lock(&self.last_telemetry).clone();
+        result.status = status.into();
+        result.exit_code = exit_code;
+        if let Some(workflow) = workflow_ref {
+            result.workflow_ref = Some(workflow.into());
+        }
+        result
     }
 
     fn run_nodes(
         &self,
         nodes: &[Node],
-        ctx: &Context,
         prefix: &str,
-        track_stages: bool,
-        held: &BTreeSet<String>,
+        scope: NodeScope<'_>,
+        scope_ready: Instant,
     ) -> Result<(), GraphFailure> {
         let ordered = ordered_nodes(nodes).map_err(|e| GraphFailure::new(prefix, e))?;
-        let execute = |i: usize| {
+        let execute = |i: usize, ready: Instant| {
             let n = &ordered[i];
-            self.execute(n, &path_for(prefix, n.id()), ctx, track_stages, held)
+            self.execute(n, &path_for(prefix, n.id()), scope, ready)
         };
-        if !held.is_empty()
+        if !scope.held.is_empty()
             || self.config.max_parallel_nodes == 1
             || lock(&self.runtime).until_path.is_some()
         {
-            for i in 0..ordered.len() {
-                execute(i)?;
+            let mut finished = HashMap::new();
+            for (i, node) in ordered.iter().enumerate() {
+                let ready = node
+                    .deps()
+                    .iter()
+                    .map(|d| finished[d.as_str()])
+                    .max()
+                    .unwrap_or(scope_ready);
+                execute(i, ready)?;
+                finished.insert(node.id(), Instant::now());
                 if self.reached_path().is_some() {
                     break;
                 }
@@ -643,6 +820,7 @@ impl GraphRunner {
             .collect();
         schedule(
             deps,
+            scope_ready,
             self.config.max_parallel_nodes,
             false,
             if prefix.is_empty() { "root" } else { prefix },
@@ -654,12 +832,27 @@ impl GraphRunner {
         &self,
         node: &Node,
         path: &str,
-        ctx: &Context,
-        track_stages: bool,
-        held: &BTreeSet<String>,
+        scope: NodeScope<'_>,
+        ready_at: Instant,
     ) -> Result<(), GraphFailure> {
+        let NodeScope {
+            ctx,
+            held,
+            track_stages,
+            clock,
+        } = scope;
+        let _node_scope = NodePathGuard::enter(path);
         let kind = node.kind_str();
         let mut acquired = Resources::default();
+        let mut start = Instant::now();
+        let mut span = NodeTelemetry {
+            path: path.into(),
+            kind: kind.into(),
+            deps: node.deps().to_vec(),
+            resource: node.resource().map(str::to_owned),
+            started_at: now(),
+            ..Default::default()
+        };
         let result = (|| {
             let mut names = BTreeSet::new();
             // Only exclusive stages reserve their whole static subtree. A resource-free
@@ -675,7 +868,18 @@ impl GraphRunner {
                 // A dynamic splitter can discover a lower-ranked name after we enter.
                 // Reentry or immediate acquisition is safe, waiting out of order is not.
                 let blocking = held.contains(name) || !held.last().is_some_and(|last| name <= last);
-                if !resource.acquire(blocking) {
+                let acquired_lock = resource.acquire(blocking, |wait_start, elapsed| {
+                    let duration_ms = millis(elapsed);
+                    span.resource_wait_ms += duration_ms;
+                    span.resource_waits.push(ResourceWait {
+                        resource: name.clone(),
+                        start_offset_ms: millis(wait_start - clock.start),
+                        duration_ms,
+                    });
+                });
+                if !acquired_lock {
+                    start = Instant::now();
+                    span.started_at = now();
                     return Err(GraphFailure::new(
                         path,
                         format!(
@@ -688,22 +892,40 @@ impl GraphRunner {
             }
             names.extend(held.iter().cloned());
             let simple = matches!(node, Node::Subgraph(_) | Node::Splitter(_));
-            let started = Instant::now();
+            start = Instant::now();
+            span.started_at = now();
             if simple {
+                span.attempts = 1;
                 self.emit("node_start", json!({"node":path,"kind":kind,"attempt":1}));
             }
             match node {
-                Node::Task(n) => self.run_task(n, path, ctx, &names)?,
+                Node::Task(n) => self.run_task(n, path, ctx, &names, &mut span)?,
                 Node::Subgraph(n) => {
                     self.log(format!("[subgraph:enter] {path}"));
-                    self.run_nodes(&n.nodes, ctx, path, track_stages, &names)?;
+                    self.run_nodes(
+                        &n.nodes,
+                        path,
+                        NodeScope {
+                            held: &names,
+                            ..scope
+                        },
+                        Instant::now(),
+                    )?;
                     if self.reached_path().is_some() {
                         return Ok(());
                     }
                     self.log(format!("[subgraph:done]  {path}"));
                 }
                 Node::LoopSubgraph(n) => {
-                    self.run_loop(n, path, ctx, track_stages, &names)?;
+                    self.run_loop(
+                        n,
+                        path,
+                        NodeScope {
+                            held: &names,
+                            ..scope
+                        },
+                        &mut span,
+                    )?;
                     if self.reached_path().is_some() {
                         return Ok(());
                     }
@@ -717,22 +939,27 @@ impl GraphRunner {
                         children.len(),
                         n.max_workers
                     ));
-                    let exec = |i: usize| {
+                    let branches_ready = Instant::now();
+                    let exec = |i: usize, ready: Instant| {
                         self.execute(
                             &children[i],
                             &path_for(path, children[i].id()),
-                            ctx,
-                            false,
-                            &names,
+                            NodeScope {
+                                track_stages: false,
+                                held: &names,
+                                ..scope
+                            },
+                            ready,
                         )
                     };
                     if !names.is_empty() || n.max_workers <= 1 || children.len() <= 1 {
                         for i in 0..children.len() {
-                            exec(i)?;
+                            exec(i, branches_ready)?;
                         }
                     } else {
                         schedule(
                             vec![Vec::new(); children.len()],
+                            branches_ready,
                             n.max_workers,
                             true,
                             path,
@@ -742,7 +969,7 @@ impl GraphRunner {
                 }
             }
             if simple {
-                self.emit("node_passed", json!({"node":path,"kind":kind,"attempts":1,"duration_s":duration(started),"cache_miss_reason":null}));
+                self.emit("node_passed", json!({"node":path,"kind":kind,"attempts":1,"duration_s":duration(start),"cache_miss_reason":null}));
             }
             if track_stages {
                 let mut rt = lock(&self.runtime);
@@ -753,6 +980,27 @@ impl GraphRunner {
             }
             Ok(())
         })();
+        let end = Instant::now();
+        span.finished_at = now();
+        span.start_offset_ms = millis(start - clock.start);
+        span.end_offset_ms = millis(end - clock.start);
+        span.duration_ms = millis(end - start);
+        span.queue_wait_ms = millis(start.saturating_duration_since(ready_at));
+        span.status = match &result {
+            Err(e) => node_failure_status(e),
+            Ok(()) if span.cached => "cached",
+            Ok(())
+                if !matches!(node, Node::Task(_))
+                    && self.reached_path().is_some_and(|p| p != path) =>
+            {
+                "stopped"
+            }
+            Ok(()) => "passed",
+        }
+        .into();
+        span.circuit_broken = result.as_ref().is_err_and(|e| e.circuit_broken);
+        span.repaired = span.status == "passed" && !span.error_signatures.is_empty();
+        lock(&clock.nodes).push(span);
         if let Err(e) = &result {
             self.emit(
                 &format!("node_{}", node_failure_status(e)),
@@ -785,6 +1033,7 @@ impl GraphRunner {
         path: &str,
         ctx: &Context,
         held: &BTreeSet<String>,
+        span: &mut NodeTelemetry,
     ) -> Result<(), GraphFailure> {
         let started = Instant::now();
         let input_hash =
@@ -793,6 +1042,7 @@ impl GraphRunner {
         let (fresh, reason) =
             self.freshness_reason(path, &n.id, &input_hash, &outputs, n.cacheable);
         if fresh {
+            span.cached = true;
             self.log(format!("[graph:cached] {path}"));
             lock(&self.runtime)
                 .trace
@@ -803,6 +1053,7 @@ impl GraphRunner {
             );
             return Ok(());
         }
+        span.cache_miss_reason = Some(reason.clone());
         let fields = json!({"kind":n.kind,"input_hash":input_hash,"cache_miss_reason":reason,"outputs":outputs});
         let record_error = |attempt: usize, detail: String| -> GraphFailure {
             let failure = json!({"status":"failed","attempts":attempt,"duration_s":duration(started),"error_signature":"exception:Error","detail":detail,"updated_at":now()});
@@ -816,6 +1067,7 @@ impl GraphRunner {
         } else {
             Vec::new()
         };
+        let mut last_context_usage = None;
         let mut previous = None;
         for attempt in 0..=n.max_retries {
             let count = attempt + 1;
@@ -829,7 +1081,20 @@ impl GraphRunner {
                 json!({"node":path,"kind":n.kind,"attempt":count}),
             );
             let mut detached = None;
-            let outcome = invoke(n, ctx, attempt, &resources, &mut detached).and_then(|value| {
+            span.attempts = count;
+            let result = invoke(n, ctx, path, attempt, &resources, &mut detached);
+            let direct = result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("__kgraph_usage"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let usage_records = result
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("__kgraph_usage_records"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default();
+            let outcome = result.and_then(|value| {
                 callback(|| {
                     let outcome = n
                         .verify_fn
@@ -843,10 +1108,28 @@ impl GraphRunner {
                 })
                 .map_err(TaskRunError::other)
             });
+            // Returned usage is per call. The context fallback is a node-level
+            // snapshot and can persist through verification and subsequent retries.
+            let current = context_usage(ctx, path);
+            let usage =
+                direct.or_else(|| usage_increment(last_context_usage.as_ref(), current.as_ref()));
+            last_context_usage = current;
+            if let Some(usage) = usage {
+                span.agent_usage
+                    .get_or_insert_with(Default::default)
+                    .add_assign(&usage);
+                span.attempt_usage.push(AttemptUsage {
+                    attempt: count,
+                    failed: !outcome.as_ref().is_ok_and(|o| o.ok),
+                    usage,
+                    usage_records,
+                });
+            }
             let outcome = match outcome {
                 Ok(verified) => verified,
                 Err(TaskRunError::Graph(e)) => {
                     let mut e = *e;
+                    span.error_signatures.push(e.status_str().into());
                     let primary = e.packet_path.take();
                     let paths = std::mem::take(&mut e.packet_paths);
                     let e = e.with_packets(primary, paths);
@@ -874,7 +1157,10 @@ impl GraphRunner {
                     }
                     Ok((paths, hashes, (n.input_hash_fn)(ctx)?))
                 })
-                .map_err(|e| record_error(count, e))?;
+                .map_err(|e| {
+                    span.error_signatures.push("exception:Error".into());
+                    record_error(count, e)
+                })?;
                 let dur = duration(started);
                 self.record(path, extend(fields, json!({"status":"passed","input_hash":final_hash,"attempts":count,"duration_s":dur,
                     "detail":outcome.detail,"outputs":out_paths,"output_hashes":hashes,"updated_at":now()})),true)?;
@@ -893,6 +1179,7 @@ impl GraphRunner {
                 self.emit("node_passed",json!({"node":path,"kind":n.kind,"attempts":count,"duration_s":dur,"cache_miss_reason":reason}));
                 return Ok(());
             }
+            span.error_signatures.push(outcome.error_signature.clone());
             let broken = previous.as_ref() == Some(&outcome.error_signature);
             if broken || attempt == n.max_retries {
                 return self.verification_failed(path, fields, count, started, &outcome, broken);
@@ -908,7 +1195,10 @@ impl GraphRunner {
             }
             if let Some(repair) = &n.repair_fn {
                 metadata(|| repair(ctx, count, &outcome.error_signature, &outcome.detail))
-                    .map_err(|e| record_error(count, e))?;
+                    .map_err(|e| {
+                        span.error_signatures.push("exception:Error".into());
+                        record_error(count, e)
+                    })?;
             }
             previous = Some(outcome.error_signature);
         }
@@ -919,14 +1209,15 @@ impl GraphRunner {
         &self,
         n: &LoopSubgraphNode,
         path: &str,
-        ctx: &Context,
-        track_stages: bool,
-        held: &BTreeSet<String>,
+        scope: NodeScope<'_>,
+        span: &mut NodeTelemetry,
     ) -> Result<(), GraphFailure> {
+        let ctx = scope.ctx;
         let started = Instant::now();
         let mut previous = None;
         for attempt in 0..=n.max_retries {
             let count = attempt + 1;
+            span.attempts = count;
             self.log(format!(
                 "[loop_sg:iter] {path} (attempt {count}/{})",
                 n.max_retries + 1
@@ -935,7 +1226,7 @@ impl GraphRunner {
                 "node_start",
                 json!({"node":path,"kind":"loop_subgraph","attempt":count}),
             );
-            self.run_nodes(&n.nodes, ctx, path, track_stages, held)?;
+            self.run_nodes(&n.nodes, path, scope, Instant::now())?;
             if self.reached_path().is_some() {
                 return Ok(());
             }
@@ -952,6 +1243,7 @@ impl GraphRunner {
                 self.emit("node_passed",json!({"node":path,"kind":"loop_subgraph","attempts":count,"duration_s":dur,"cache_miss_reason":null}));
                 return Ok(());
             }
+            span.error_signatures.push(outcome.error_signature.clone());
             let broken = previous.as_ref() == Some(&outcome.error_signature);
             if broken || attempt == n.max_retries {
                 return self.verification_failed(
@@ -1120,13 +1412,19 @@ impl GraphRunner {
             "circuit_broken":count("circuit_broken"),"retried_nodes":retried,"worker_calls_used":worker_calls,"max_worker_calls":self.config.max_worker_calls}),
             json!(efficiency),
         );
+        let telemetry_summary = {
+            let run = lock(&self.last_telemetry);
+            json!({"run_id":run.run_id,"wall_time_ms":run.wall_time_ms,"total_work_ms":run.total_work_ms,
+                   "parallelism_factor":run.parallelism_factor,"critical_path":run.critical_path,
+                   "cache_hit_rate_pct":run.cache_hit_rate_pct,"total_tokens":run.total_tokens,"total_cost_usd":run.total_cost_usd})
+        };
         let mut report = json!({
             "version":1,"status":if overall_status=="passed" && reached.is_some() {"stopped"} else {overall_status},
             "error":error,"awaiting_subagents":overall_status=="awaiting_subagents","packet_path":packets.packet_path,
             "packet_paths":packets.packet_paths,"cached_nodes":cached_nodes,"requested_until":self.config.until,
             "requested_path":requested,"reached_path":reached,"last_completed_stage":last,"generated_at":now(),"state_file":self.config.state_path,
             "scope":{"requested_until":self.config.until,"stop_reached":reached.is_some(),"reached_nodes":reached_nodes},
-            "summary":summary,"failure_signatures":failure_sigs,"slowest_nodes":slowest,"evolution_hints":hints,
+            "summary":summary,"telemetry_summary":telemetry_summary,"failure_signatures":failure_sigs,"slowest_nodes":slowest,"evolution_hints":hints,
         });
         if let Some(extra) = extra_fields {
             report.as_object_mut().unwrap().extend(extra.clone());
@@ -1185,6 +1483,7 @@ fn build_children(split: &SplitterNode, ctx: &Context) -> Result<Vec<Node>, Stri
 fn invoke(
     n: &TaskNode,
     ctx: &Context,
+    path: &str,
     attempt: usize,
     resources: &[Arc<ResourceLock>],
     detached: &mut Option<thread::JoinHandle<()>>,
@@ -1198,8 +1497,10 @@ fn invoke(
     let ctx = ctx.clone();
     let (send, recv) = mpsc::channel();
     let reservation = CallbackReservation::new(resources);
+    let path = path.to_owned();
     let worker = thread::Builder::new()
         .spawn(move || {
+            let _node_scope = NodePathGuard::enter(&path);
             let result = callback(|| function(&ctx, attempt))
                 .map_err(TaskRunError::other)
                 .and_then(|r| r);
@@ -1225,10 +1526,11 @@ fn invoke(
 // so a dependent can start as soon as its final prerequisite completes.
 fn schedule(
     deps: Vec<Vec<usize>>,
+    scope_ready: Instant,
     limit: usize,
     splitter: bool,
     path: &str,
-    execute: impl Fn(usize) -> Result<(), GraphFailure> + Sync,
+    execute: impl Fn(usize, Instant) -> Result<(), GraphFailure> + Sync,
 ) -> Result<(), GraphFailure> {
     let limit = limit.min(deps.len());
     if limit == 0 {
@@ -1236,6 +1538,7 @@ fn schedule(
     }
     let mut ready = VecDeque::new();
     let mut remaining = Vec::with_capacity(deps.len());
+    let mut ready_at = vec![scope_ready; deps.len()];
     let mut dependents = vec![Vec::new(); deps.len()];
     for (i, parents) in deps.into_iter().enumerate() {
         remaining.push(parents.len());
@@ -1247,7 +1550,7 @@ fn schedule(
         }
     }
     let mut errors = BTreeMap::new();
-    let (work, jobs) = mpsc::channel::<usize>();
+    let (work, jobs) = mpsc::channel::<(usize, Instant)>();
     let jobs = Mutex::new(jobs);
     let (done, completed) = mpsc::channel();
     thread::scope(|workers| {
@@ -1255,11 +1558,11 @@ fn schedule(
             let (jobs, execute, done) = (&jobs, &execute, done.clone());
             workers.spawn(move || loop {
                 let job = lock(jobs).recv();
-                let Ok(i) = job else { break };
-                let result = callback(|| execute(i))
+                let Ok((i, ready_at)) = job else { break };
+                let result = callback(|| execute(i, ready_at))
                     .map_err(|e| GraphFailure::new(path, e))
                     .and_then(|r| r);
-                if done.send((i, result)).is_err() {
+                if done.send((i, result, Instant::now())).is_err() {
                     break;
                 }
             });
@@ -1269,7 +1572,7 @@ fn schedule(
         loop {
             while active < limit && (splitter || errors.is_empty()) {
                 let Some(i) = ready.pop_front() else { break };
-                work.send(i).expect("worker pool alive");
+                work.send((i, ready_at[i])).expect("worker pool alive");
                 active += 1;
             }
             if active == 0 {
@@ -1278,7 +1581,7 @@ fn schedule(
             let first = completed
                 .recv()
                 .expect("workers send one completion per job");
-            for (i, result) in std::iter::once(first).chain(completed.try_iter()) {
+            for (i, result, finished) in std::iter::once(first).chain(completed.try_iter()) {
                 active -= 1;
                 match result {
                     Err(e) => {
@@ -1286,6 +1589,7 @@ fn schedule(
                     }
                     Ok(()) => {
                         for &child in &dependents[i] {
+                            ready_at[child] = ready_at[child].max(finished);
                             remaining[child] -= 1;
                             if remaining[child] == 0 {
                                 ready.push_back(child);
@@ -2188,6 +2492,165 @@ mod tests {
 
     // Re-enter this test in two processes to exercise OS advisory locking. Each
     // process starts with an old snapshot and waits for its sibling's running write.
+    #[test]
+    fn telemetry_history_records_retries_cost_cache_and_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let runner = GraphRunner::new(RunnerConfig {
+            telemetry_path: Some(path.clone()),
+            ..config(dir.path())
+        })
+        .unwrap();
+        let ctx = Context::new();
+        ctx.insert("git_head", json!("abc"));
+        ctx.insert("git_dirty", json!(false));
+        ctx.insert("workflow_ref", json!("demo"));
+        let mut worker = task("worker");
+        worker.max_retries = 1;
+        worker.run_fn = Arc::new(|_, attempt| {
+            Ok(
+                json!({"ok":attempt==1,"__kgraph_usage":{"model":"m","provider":"p","input_tokens":5,"cost_usd":0.25}}),
+            )
+        });
+        worker.verify_fn = Some(Arc::new(|_, v| {
+            if v["ok"] == true {
+                VerifyOutcome::pass("ok")
+            } else {
+                VerifyOutcome::fail("lint", "try again")
+            }
+        }));
+        let nodes = vec![Node::Task(worker)];
+        runner.run(&nodes, &ctx, "nested").unwrap();
+        let first = runner.build_run_telemetry("passed", 0, None);
+        let n = &first.nodes[0];
+        assert_eq!(n.path, "nested/worker");
+        assert!(n.repaired);
+        assert_eq!(n.error_signatures, ["lint"]);
+        assert_eq!(n.attempts, 2);
+        assert_eq!(n.cache_miss_reason.as_deref(), Some("no_prior_state"));
+        assert_eq!(first.git_head.as_deref(), Some("abc"));
+        assert_eq!(first.git_dirty, Some(false));
+        assert_eq!(first.workflow_ref.as_deref(), Some("demo"));
+        assert_eq!(first.total_tokens, 10);
+        assert_eq!(first.total_cost_usd, 0.5);
+        assert!(n.duration_ms > 0.);
+        assert!((n.end_offset_ms - n.start_offset_ms - n.duration_ms).abs() < 0.000001);
+        assert!(n.end_offset_ms <= first.wall_time_ms);
+        assert!(n.start_offset_ms >= n.queue_wait_ms);
+        assert_eq!(
+            report(&runner, "passed")["telemetry_summary"]["run_id"],
+            first.run_id
+        );
+        assert_eq!(runner.state().version, 3);
+
+        runner.run(&nodes, &ctx, "nested").unwrap();
+        let cached = runner.build_run_telemetry("passed", 0, Some("override"));
+        assert_ne!(cached.run_id, first.run_id);
+        assert_eq!(cached.workflow_ref.as_deref(), Some("override"));
+        assert_eq!(cached.nodes.len(), 1);
+        assert_eq!(cached.cache_hit_rate_pct, 100.);
+        assert_eq!(cached.nodes[0].attempts, 0);
+        assert!(cached.nodes[0].cache_miss_reason.is_none());
+        assert_eq!(cached.total_tokens, 0);
+        let mut bad = task("bad");
+        bad.max_retries = 1;
+        bad.run_fn = Arc::new(|ctx, _| {
+            ctx.insert(
+                "__kgraph_usage",
+                json!({"nested/bad":{"input_tokens":300,"cost_usd":0.2}}),
+            );
+            Err(TaskRunError::other("problem"))
+        });
+        let e = runner.run(&[Node::Task(bad)], &ctx, "nested").unwrap_err();
+        assert!(e.circuit_broken);
+        let history = telemetry::read_telemetry_runs(&path, Some("demo"), None).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].run_id, first.run_id);
+        assert_eq!(history[2].exit_code, e.exit_code());
+        assert_eq!(history[2].status, "circuit_broken");
+        assert_eq!(history[2].circuit_broken_nodes, 1);
+        assert_eq!(history[2].nodes[0].error_signatures.len(), 2);
+        assert_eq!(history[2].total_tokens, 300);
+        assert_eq!(history[2].total_cost_usd, 0.2);
+        let a = telemetry::analyze_telemetry(&history);
+        assert_eq!(a.failure_burn_tokens, 305);
+    }
+
+    #[test]
+    fn telemetry_measures_exclusive_wait_and_readiness_in_sequential_queue() {
+        let dir = tempdir().unwrap();
+        let runner = GraphRunner::new(config(dir.path())).unwrap();
+        let resource = Arc::new(ResourceLock::default());
+        lock(&runner.resources).insert("device".into(), resource.clone());
+        assert!(resource.acquire(true, |_, _| panic!("uncontended lock waited")));
+        let mut first = task("first");
+        first.resource = Some("device".into());
+        first.run_fn = Arc::new(|_, _| {
+            thread::sleep(Duration::from_millis(20));
+            Ok(Value::Null)
+        });
+        let mut dependent = task("dependent");
+        dependent.deps.push("first".into());
+        let nodes = [
+            Node::Task(first),
+            Node::Task(task("independent")),
+            Node::Task(dependent),
+        ];
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| run(&runner, &nodes).unwrap());
+            let start = Instant::now();
+            while Arc::strong_count(&resource) < 3 {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(40));
+            resource.release();
+            worker.join().unwrap();
+        });
+        let run = runner.build_run_telemetry("passed", 0, None);
+        let first = &run.nodes[0];
+        assert!(first.resource_wait_ms >= 15.);
+        let wait = &first.resource_waits[0];
+        assert_eq!(wait.resource, "device");
+        assert!(wait.start_offset_ms + wait.duration_ms <= first.start_offset_ms);
+        let chrome = telemetry::export_chrome_trace(&run);
+        assert_eq!(chrome["traceEvents"][0]["ts"], wait.start_offset_ms * 1000.);
+        assert!(first.queue_wait_ms >= first.resource_wait_ms);
+        assert!(first.duration_ms >= 15.);
+        let independent = &run.nodes[1];
+        let dependent = &run.nodes[2];
+        assert!(independent.queue_wait_ms >= first.end_offset_ms);
+        assert_eq!(independent.resource_wait_ms, 0.);
+        assert!(dependent.queue_wait_ms <= dependent.start_offset_ms - first.end_offset_ms + 0.001);
+    }
+
+    #[test]
+    fn telemetry_write_errors_preserve_graph_results_and_validation_failures() {
+        let dir = tempdir().unwrap();
+        let cfg = config(dir.path());
+        let invalid_sink = dir.path().join("directory");
+        fs::create_dir(&invalid_sink).unwrap();
+        let invalid = GraphRunner::new(RunnerConfig {
+            telemetry_path: Some(invalid_sink),
+            ..cfg.clone()
+        })
+        .unwrap();
+        run(&invalid, &[Node::Task(task("ok"))]).unwrap();
+        let sink = dir.path().join("run.jsonl");
+        let r = GraphRunner::new(RunnerConfig {
+            telemetry_path: Some(sink.clone()),
+            ..cfg
+        })
+        .unwrap();
+        let mut bad = task("bad");
+        bad.deps.push("missing".into());
+        assert!(run(&r, &[Node::Task(bad)]).is_err());
+        let runs = telemetry::read_telemetry_runs(&sink, None, None).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].nodes_total, 0);
+    }
+
     #[test]
     fn cross_process_state_merge() {
         const KEY: &str = "KGRAPH_TEST_MERGE_DIRECTORY";
