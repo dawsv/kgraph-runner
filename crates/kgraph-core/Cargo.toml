@@ -21,3 +21,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
