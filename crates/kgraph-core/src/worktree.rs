@@ -752,7 +752,7 @@ mod tests {
         let tree = IsolatedWorktree::create(spec.clone()).unwrap();
         assert_eq!(
             tree.path().parent().unwrap(),
-            spec.worktree_base.canonicalize().unwrap()
+            canonical(&spec.worktree_base).unwrap()
         );
         assert!(IsolatedWorktree::create(spec.clone()).is_err());
         fs::write(tree.path().join("shared.txt"), "failure\n").unwrap();
