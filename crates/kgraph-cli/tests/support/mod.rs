@@ -16,9 +16,7 @@ impl Project {
         p
     }
     pub fn path(&self, path: &str) -> PathBuf {
-        kgraph_town::interactions::resolve(self.0.path())
-            .unwrap()
-            .join(path)
+        kgraph_town::interactions::resolve(&self.0.path().join(path)).unwrap()
     }
     pub fn write(&self, path: &str, data: &Value) {
         kgraph_core::files::write_json(&self.path(path), data, true).unwrap();

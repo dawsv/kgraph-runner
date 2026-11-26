@@ -98,6 +98,7 @@ impl CommandProcess {
             command.process_group(0);
         }
         let child = command
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
