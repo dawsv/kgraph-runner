@@ -6,10 +6,11 @@ Instead of re-running everything from scratch when something fails, KGraph Runne
 
 - **Automatic caching** — skips steps whose inputs and outputs have not changed (SHA-256 verified).
 - **Parallel execution** — runs independent steps at the same time, with optional isolated Git worktrees when workers edit files.
-- **Bounded retries & evaluator loops** — automatically checks outputs and feeds failure details back into the next attempt.
+- **Loop engineering guardrails** — bounded evaluator retries, **oscillation & stagnation circuit breakers** (`A → A` and ping-pong `A → B → A`), hard **cost/token/wall-time `[budgets]`**, exponential **backoff for transient 429/529 rate limits**, compacted retry feedback, and **`immutable_paths` / `protect_globs`** anti-reward-hijacking checks.
+- **Expressive graph controls** — safe **`when`** conditional execution over context/outputs and guaranteed **`finally`** cleanup/escalation hooks.
 - **Reusable building blocks** — share subgraphs across projects (`@lib/...`), project templates (`kgraph init`), and built-in presets.
-- **Hero Town live dashboard** — watch progress live in your browser, inspect logs, approve human review gates, and track QA scorecards (`kgraph-town ui` / `hub`).
-- **Built-in AI agent integration (MCP)** — exposes 13 structured tools over `kgraph mcp` so any MCP-compatible AI assistant can plan, run, monitor, and analyze workflows.
+- **Hero Town live dashboard & notifications** — watch progress live in your browser (`kgraph-town ui` / `hub`), approve human review gates, or get optional webhook/desktop pings (`--notify-webhook`, `--notify-desktop`).
+- **Built-in AI agent integration (MCP)** — exposes **15 tools** and **3 discovery resources** (`kgraph://schema`, `kgraph://subgraphs`, `kgraph://templates`) over `kgraph mcp`.
 
 Works on **macOS, Linux, and Windows** via native Rust binaries (`kgraph` and `kgraph-town`), plus an optional zero-dependency Python reference package.
 
@@ -166,15 +167,16 @@ If the user has global agent instructions (`~/.codex/AGENTS.md`, `~/.gemini/GEMI
 
 Run all three checks before declaring setup complete:
 
-1. **CLI binaries work on `PATH`:**
+1. **CLI binaries & setup health check:**
    ```sh
-   kgraph --help >/dev/null && kgraph-town --help >/dev/null && echo "CLI OK"
+   kgraph doctor
    ```
-2. **MCP server responds with all 13 tools:**
+   Confirm `kgraph` and `kgraph-town` are on `PATH`, `git` is detected, and the MCP client config shows `configured`.
+2. **MCP server responds with all 15 tools and 3 discovery resources:**
    ```sh
-   printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n' | kgraph mcp
+   printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}\n{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{}}\n' | kgraph mcp
    ```
-   Confirm the second JSON response lists 13 tools (`kgraph_plan`, `kgraph_run`, `kgraph_status`, `kgraph_report`, `kgraph_analyze`, `kgraph_workboard`, `kgraph_claim`, `kgraph_heartbeat`, `kgraph_release`, `kgraph_complete`, `kgraph_progress`, `kgraph_ask`, `kgraph_answer`).
+   Confirm the second JSON response lists 15 tools (`kgraph_plan`, `kgraph_run`, `kgraph_status`, `kgraph_report`, `kgraph_analyze`, `kgraph_workboard`, `kgraph_claim`, `kgraph_heartbeat`, `kgraph_release`, `kgraph_complete`, `kgraph_progress`, `kgraph_ask`, `kgraph_answer`, `kgraph_doctor`, `kgraph_clean`) and the third lists `kgraph://schema`, `kgraph://subgraphs`, and `kgraph://templates`.
 3. **Reusable `@lib` subgraph resolution & execution work:**
    Create a temporary workflow in a temp directory referencing `type = "subgraph"` and `from = "@lib/verify_command"`, run `kgraph plan` and `kgraph run`, confirm exit code `0`, and remove the temp directory.
 
@@ -280,7 +282,10 @@ GraphRunner(Path("graph-state.json")).run([greeting], {"name": "World"})
 | `kgraph-town ui <workflow>` | Open the live **Hero Town** browser dashboard for a single workflow (with SSE live updates, logs, approvals, and QA scorecards) |
 | `kgraph-town hub` | Serve a multi-project dashboard tracking runs across repositories |
 | `kgraph-town render <workflow>` | Export a self-contained single-file HTML snapshot of a run |
-| `kgraph mcp` | Serve 13 structured MCP tools over stdio for AI agents |
+| `kgraph mcp` | Serve 15 structured MCP tools + 3 discovery resources (`kgraph://schema`, `kgraph://subgraphs`, `kgraph://templates`) over stdio |
+| `kgraph doctor` | Check binary paths, Git/Rust/agent CLIs, shared `@lib` subgraphs, and MCP client registration |
+| `kgraph clean` | Prune orphaned `.kgraph` Git worktrees and stale lock/runtime files (`--dry-run`, `--all`) |
+| `kgraph schema` | Emit the Draft 2020-12 JSON Schema for declarative TOML/JSON workflows |
 | `kgraph workboard` / `claim` / `complete` | Coordinate parallel workers claiming waiting packets with expiring leases |
 | `kgraph status` / `report` / `qa` | Inspect saved node state, summarize run reports, and record manual QA checks |
 

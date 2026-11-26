@@ -2,7 +2,7 @@
 use crate::{
     analyze,
     args::{Cli, Command},
-    default_file, execution, swarm, town, Result,
+    clean, default_file, doctor, execution, swarm, town, Result,
 };
 use clap::{Arg, ArgAction, CommandFactory, Parser};
 use kgraph_town::interactions::{json_file, read_subtask_answer};
@@ -16,7 +16,7 @@ use std::{
 const MAX_MCP_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MCP_FILE_BYTES: usize = 16 * 1024 * 1024;
 
-const TOOLS: [&str; 13] = [
+const TOOLS: [&str; 15] = [
     "plan",
     "run",
     "status",
@@ -30,6 +30,8 @@ const TOOLS: [&str; 13] = [
     "progress",
     "ask",
     "answer",
+    "doctor",
+    "clean",
 ];
 
 // The transport owns formatting. MCP calls execute once and return local results.
@@ -42,7 +44,10 @@ fn exposed(command: &str, arg: &Arg) -> bool {
         return false;
     }
     match command {
-        "run" => !matches!(key, "hub_url" | "hub_token"),
+        "run" => !matches!(
+            key,
+            "hub_url" | "hub_token" | "notify_webhook" | "notify_secret" | "notify_desktop"
+        ),
         "progress" | "ask" => !matches!(
             key,
             "push"
@@ -183,6 +188,9 @@ fn call_tool(params: &Value) -> Result<(Value, bool)> {
         Command::Run(mut args) => {
             args.hub_url = None;
             args.hub_token = None;
+            args.notify_webhook = None;
+            args.notify_secret = None;
+            args.notify_desktop = false;
             args.quiet = true;
             let report = args
                 .report
@@ -210,9 +218,63 @@ fn call_tool(params: &Value) -> Result<(Value, bool)> {
         Command::Answer {
             state, node, item, ..
         } => json!({"answer":read_subtask_answer(&state, &node, &item)?}),
+        Command::Doctor { .. } => doctor::report(),
+        Command::Clean(args) => clean::run_data(&args)?,
         _ => unreachable!("only exposed commands are parsed"),
     };
     Ok((value, false))
+}
+
+fn list_resources() -> Value {
+    json!({
+        "resources": [
+            {
+                "uri": "kgraph://schema",
+                "name": "KGraph Workflow JSON Schema",
+                "description": "Draft 2020-12 JSON Schema for declarative TOML/JSON KGraph workflows.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "kgraph://subgraphs",
+                "name": "Shared Library Subgraphs (@lib/...)",
+                "description": "Catalog of reusable subgraphs installed under $KGRAPH_HOME/subgraphs/.",
+                "mimeType": "application/json"
+            },
+            {
+                "uri": "kgraph://templates",
+                "name": "Starter Workflow Templates",
+                "description": "Templates supported by `kgraph init <template>`.",
+                "mimeType": "application/json"
+            }
+        ]
+    })
+}
+
+fn read_resource(params: &Value) -> Result<Value> {
+    let uri = params["uri"].as_str().ok_or("Expected resource uri")?;
+    let payload = match uri {
+        "kgraph://schema" => kgraph_subgraphs::workflow_json_schema(),
+        "kgraph://subgraphs" => json!({"subgraphs": doctor::list_library_subgraphs()}),
+        "kgraph://templates" => json!({
+            "templates": [
+                {"name": "ci", "description": "Lint, test, and build verification pipeline"},
+                {"name": "agent-loop", "description": "Agent worker + deterministic verifier + evaluator loop"},
+                {"name": "swarm-splitter", "description": "Parallel Git worktree splitter with ordered reduction"},
+                {"name": "bug-fix", "description": "Single-bug bounded fix and verification loop"},
+                {"name": "bug-batch", "description": "Multi-bug batch workflow with consolidated QA report"},
+                {"name": "release", "description": "Release packaging with human approval gate"}
+            ]
+        }),
+        _ => return Err(format!("Unknown resource URI: {uri}")),
+    };
+    let text = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": "application/json",
+            "text": text
+        }]
+    }))
 }
 fn error(id: &Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
@@ -226,6 +288,8 @@ fn isolated_run(params: &Value) -> Result<Value> {
         .args(["mcp", "--once"])
         .env_remove("KGRAPH_HUB_URL")
         .env_remove("KGRAPH_HUB_TOKEN")
+        .env_remove("KGRAPH_NOTIFY_WEBHOOK")
+        .env_remove("KGRAPH_NOTIFY_SECRET")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -290,13 +354,18 @@ fn handle(line: &[u8], isolate_runs: bool) -> Option<Value> {
     let result = match method? {
         "notifications/initialized" => return None,
         "initialize" => {
-            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"kgraph","version":env!("CARGO_PKG_VERSION")}})
+            json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"kgraph","version":env!("CARGO_PKG_VERSION")}})
         }
         "ping" => json!({}),
         "tools/list" => {
             let root = Cli::command();
             json!({"tools":TOOLS.iter().map(|name| definition(root.find_subcommand(name).unwrap())).collect::<Vec<_>>()})
         }
+        "resources/list" => list_resources(),
+        "resources/read" => match read_resource(&request["params"]) {
+            Ok(res) => res,
+            Err(msg) => return Some(error(id, -32602, &msg)),
+        },
         "tools/call" if isolate_runs && request["params"]["name"] == "kgraph_run" => {
             isolated_run(&request["params"]).unwrap_or_else(|error| tool_result(Err(error)))
         }

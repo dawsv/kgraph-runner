@@ -8,6 +8,8 @@ use crate::{
 };
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -28,6 +30,14 @@ pub struct RunnerConfig {
     pub force: bool,
     pub until: Option<String>,
     pub max_worker_calls: Option<usize>,
+    /// Optional cumulative USD cost ceiling across all agent calls in a single run.
+    pub max_cost_usd: Option<f64>,
+    /// Optional cumulative token ceiling (`input + output + cached`) across a single run.
+    pub max_tokens: Option<u64>,
+    /// Optional wall-clock duration ceiling in seconds for the entire run.
+    pub max_wall_time_s: Option<f64>,
+    /// Cleanup or escalation nodes executed unconditionally after the main graph completes.
+    pub finally_nodes: Vec<Node>,
     pub max_parallel_nodes: usize,
     pub logger: Option<LoggerFn>,
     pub on_event: Option<EventHook>,
@@ -42,6 +52,10 @@ impl Default for RunnerConfig {
             force: false,
             until: None,
             max_worker_calls: None,
+            max_cost_usd: None,
+            max_tokens: None,
+            max_wall_time_s: None,
+            finally_nodes: Vec::new(),
             max_parallel_nodes: 1,
             logger: None,
             on_event: None,
@@ -65,6 +79,9 @@ struct Runtime {
     write_buf: Vec<u8>,
     retry_nodes: HashSet<String>,
     worker_calls: usize,
+    total_tokens: u64,
+    total_cost_usd: f64,
+    run_started: Option<Instant>,
     efficiency: EfficiencyCounts,
     trace: Vec<Value>,
     until_path: Option<String>,
@@ -149,7 +166,88 @@ struct NodeScope<'a> {
     ctx: &'a Context,
     held: &'a BTreeSet<String>,
     track_stages: bool,
+    in_finally: bool,
     clock: &'a RunClock,
+}
+
+static DEFAULT_TRANSIENT_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:\b429\b|\b529\b|rate[-_ ]?limit|too many requests|overloaded|temporarily unavailable|service unavailable|econnreset|etimedout|connection reset|timeout)")
+        .expect("default transient regex")
+});
+
+fn is_transient_failure(policy: &RetryPolicy, outcome: &VerifyOutcome) -> bool {
+    if policy.transient_retries == 0 {
+        return false;
+    }
+    let haystack = format!("{} {}", outcome.error_signature, outcome.detail);
+    if let Some(custom) = policy.transient_error_regex.as_deref() {
+        Regex::new(custom)
+            .map(|re| re.is_match(&haystack))
+            .unwrap_or(false)
+    } else {
+        DEFAULT_TRANSIENT_REGEX.is_match(&haystack)
+    }
+}
+
+fn backoff_duration(policy: &RetryPolicy, retry_index: usize) -> Option<Duration> {
+    let base = policy.backoff_s?;
+    if !base.is_finite() || base <= 0.0 {
+        return None;
+    }
+    let cap = policy
+        .max_backoff_s
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(60.0);
+    let factor = 2f64.powi(retry_index.min(16) as i32);
+    let mut secs = (base * factor).min(cap);
+    if policy.jitter {
+        // Light deterministic spread (±15%) keyed by retry index + nanos to avoid thundering herds.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let bucket = ((nanos as usize).wrapping_add(retry_index * 31) % 31) as f64 / 100.0; // 0.00..=0.30
+        secs *= 0.85 + bucket;
+    }
+    Some(Duration::from_secs_f64(secs.max(0.0)))
+}
+
+/// Detect either immediate stagnation (`A -> A`) or ping-pong oscillation (`A -> B -> A`).
+fn detect_breaker(history: &[String], current: &str, oscillation: bool) -> Option<String> {
+    if history.last().is_some_and(|p| p == current) {
+        return Some(format!("2x '{current}'"));
+    }
+    if oscillation {
+        if let Some(pos) = history.iter().position(|s| s == current) {
+            let mut cycle: Vec<&str> = history[pos..].iter().map(String::as_str).collect();
+            cycle.push(current);
+            return Some(format!("oscillation: {}", cycle.join(" -> ")));
+        }
+    }
+    None
+}
+
+fn snapshot_protected(protected: &ProtectedPaths) -> Result<String, String> {
+    let mut parts = Vec::new();
+    if !protected.paths.is_empty() {
+        parts.push(hash::hash_paths(
+            &protected.paths,
+            Some(&protected.base_dir),
+            None,
+            &[],
+            false,
+        )?);
+    }
+    if !protected.globs.is_empty() {
+        parts.push(hash::hash_globs(
+            &protected.globs,
+            Some(&protected.base_dir),
+            None,
+            &[],
+            false,
+        )?);
+    }
+    Ok(parts.join(":"))
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -853,35 +951,54 @@ impl GraphRunner {
             let mut detail = None;
             let mut children = Vec::new();
             let mut ordered = Vec::new();
-            match n {
-                Node::Task(task) => {
-                    let inputs =
-                        callback(|| Ok(((task.input_hash_fn)(ctx)?, (task.outputs_fn)(ctx)?)))
-                            .map_err(|e| GraphFailure::new(&path, e))?;
-                    let (fresh, cache_reason) = match inputs {
-                        Ok((hash, outputs)) => {
-                            self.freshness_reason(&path, n.id(), &hash, &outputs, task.cacheable)
-                        }
-                        Err(error) => {
-                            detail = Some(error);
-                            (false, "inputs_unavailable".into())
-                        }
-                    };
-                    status = if fresh { "cached" } else { "will_run" };
-                    reason = Some(cache_reason);
-                }
-                Node::Splitter(split) => match callback(|| build_children(split, ctx))
-                    .map_err(|e| GraphFailure::new(&path, e))?
-                {
-                    Ok(items) => {
-                        node_index(&items).map_err(|e| GraphFailure::new(&path, e))?;
-                        children = items;
+            let mut skipped = false;
+            if let Some(when) = n.when_fn() {
+                match callback(|| when(ctx)).map_err(|e| GraphFailure::new(&path, e))? {
+                    Ok(false) => {
+                        skipped = true;
+                        status = "skipped";
+                        reason = Some("condition_false".into());
+                        detail = n
+                            .when_expr()
+                            .map(|expr| format!("Skipped by condition: {expr}"));
                     }
-                    Err(error) => detail = Some(error),
-                },
-                _ => {
-                    ordered = ordered_nodes(static_children(n).unwrap_or_default())
+                    Ok(true) => (),
+                    Err(error) => {
+                        detail = Some(format!("Condition deferred: {error}"));
+                    }
+                }
+            }
+            if !skipped {
+                match n {
+                    Node::Task(task) => {
+                        let inputs =
+                            callback(|| Ok(((task.input_hash_fn)(ctx)?, (task.outputs_fn)(ctx)?)))
+                                .map_err(|e| GraphFailure::new(&path, e))?;
+                        let (fresh, cache_reason) = match inputs {
+                            Ok((hash, outputs)) => {
+                                self.freshness_reason(&path, n.id(), &hash, &outputs, task.cacheable)
+                            }
+                            Err(error) => {
+                                detail = Some(error);
+                                (false, "inputs_unavailable".into())
+                            }
+                        };
+                        status = if fresh { "cached" } else { "will_run" };
+                        reason = Some(cache_reason);
+                    }
+                    Node::Splitter(split) => match callback(|| build_children(split, ctx))
                         .map_err(|e| GraphFailure::new(&path, e))?
+                    {
+                        Ok(items) => {
+                            node_index(&items).map_err(|e| GraphFailure::new(&path, e))?;
+                            children = items;
+                        }
+                        Err(error) => detail = Some(error),
+                    },
+                    _ => {
+                        ordered = ordered_nodes(static_children(n).unwrap_or_default())
+                            .map_err(|e| GraphFailure::new(&path, e))?
+                    }
                 }
             }
             let stop = Some(path.as_str()) == until;
@@ -942,6 +1059,12 @@ impl GraphRunner {
             start: Instant::now(),
             nodes: Mutex::new(Vec::with_capacity(root_nodes.len())),
         };
+        {
+            let mut rt = lock(&self.runtime);
+            rt.total_tokens = 0;
+            rt.total_cost_usd = 0.0;
+            rt.run_started = Some(clock.start);
+        }
         let mut run = RunTelemetry {
             version: 1,
             run_id: format!(
@@ -958,7 +1081,7 @@ impl GraphRunner {
             ..Default::default()
         };
         self.emit("run_start", json!({"status":"running","error":""}));
-        let result = self
+        let mut result = self
             .resolve_until(root_nodes, prefix, false)
             .and_then(|until| {
                 lock(&self.runtime).until_path = until;
@@ -968,12 +1091,47 @@ impl GraphRunner {
                     NodeScope {
                         ctx,
                         track_stages: true,
+                        in_finally: false,
                         held: &BTreeSet::new(),
                         clock: &clock,
                     },
                     clock.start,
                 )
             });
+        if !self.config.finally_nodes.is_empty() {
+            let (main_status, main_error) = match &result {
+                Err(e) => (e.status_str(), e.to_string()),
+                Ok(()) if self.reached_path().is_some() => ("stopped", String::new()),
+                Ok(()) => ("passed", String::new()),
+            };
+            ctx.insert("__kgraph_run_status", json!(main_status));
+            ctx.insert("__kgraph_failure", json!(main_error));
+            let saved_reached = {
+                let mut rt = lock(&self.runtime);
+                rt.until_path = None;
+                rt.reached.take()
+            };
+            let finally_result = self.run_nodes(
+                &self.config.finally_nodes,
+                "finally",
+                NodeScope {
+                    ctx,
+                    track_stages: false,
+                    in_finally: true,
+                    held: &BTreeSet::new(),
+                    clock: &clock,
+                },
+                Instant::now(),
+            );
+            lock(&self.runtime).reached = saved_reached;
+            if let Err(fe) = finally_result {
+                if result.is_ok() {
+                    result = Err(fe);
+                } else {
+                    self.log(format!("[finally:err]  {fe}"));
+                }
+            }
+        }
         let (status, exit_code, error) = match &result {
             Err(e) => (e.status_str(), e.exit_code(), e.to_string()),
             Ok(()) if self.reached_path().is_some() => ("stopped", 0, String::new()),
@@ -1108,6 +1266,7 @@ impl GraphRunner {
             ctx,
             held,
             track_stages,
+            in_finally,
             clock,
         } = scope;
         let _node_scope = NodePathGuard::enter(path);
@@ -1121,7 +1280,42 @@ impl GraphRunner {
             resource: node.resource().map(str::to_owned),
             ..Default::default()
         };
+        let mut skipped_by_when = false;
         let result = (|| {
+            if !in_finally {
+                self.check_budgets(path)?;
+            }
+            if let Some(when) = node.when_fn() {
+                let should_run =
+                    metadata(|| when(ctx)).map_err(|e| GraphFailure::new(path, e))?;
+                if !should_run {
+                    skipped_by_when = true;
+                    start = Instant::now();
+                    span.started_at = now();
+                    let detail = node
+                        .when_expr()
+                        .map(|e| format!("Skipped by condition: {e}"))
+                        .unwrap_or_else(|| "Skipped by condition".into());
+                    self.record(
+                        path,
+                        json!({"kind":kind,"status":"skipped","detail":detail,"updated_at":now()}),
+                        true,
+                    )?;
+                    self.log(format!("[graph:skip]   {path} — {detail}"));
+                    self.emit(
+                        "node_skipped",
+                        json!({"node":path,"kind":kind,"detail":detail}),
+                    );
+                    if track_stages {
+                        let mut rt = lock(&self.runtime);
+                        rt.last = Some(path.into());
+                        if rt.until_path.as_deref() == Some(path) {
+                            rt.reached = Some(path.into());
+                        }
+                    }
+                    return Ok(());
+                }
+            }
             let mut names = BTreeSet::new();
             // Only exclusive stages reserve their whole static subtree. A resource-free
             // container can schedule independent children on different threads.
@@ -1167,7 +1361,7 @@ impl GraphRunner {
                 self.emit("node_start", json!({"node":path,"kind":kind,"attempt":1}));
             }
             match node {
-                Node::Task(n) => self.run_task(n, path, ctx, &names, &mut span)?,
+                Node::Task(n) => self.run_task(n, path, ctx, &names, in_finally, &mut span)?,
                 Node::Subgraph(n) => {
                     self.log(format!("[subgraph:enter] {path}"));
                     self.run_nodes(
@@ -1256,6 +1450,7 @@ impl GraphRunner {
         span.queue_wait_ms = millis(start.saturating_duration_since(ready_at));
         span.status = match &result {
             Err(e) => node_failure_status(e),
+            Ok(()) if skipped_by_when => "skipped",
             Ok(()) if span.cached => "cached",
             Ok(())
                 if !matches!(node, Node::Task(_))
@@ -1277,6 +1472,51 @@ impl GraphRunner {
             );
         }
         result
+    }
+
+    fn check_budgets(&self, path: &str) -> Result<(), GraphFailure> {
+        let rt = lock(&self.runtime);
+        if let (Some(max_s), Some(started)) = (self.config.max_wall_time_s, rt.run_started) {
+            let elapsed = started.elapsed().as_secs_f64();
+            if elapsed >= max_s {
+                let mut error = GraphFailure::new(
+                    path,
+                    format!("Wall-time budget exceeded ({elapsed:.2}s/{max_s:.2}s)"),
+                );
+                error.budget_exceeded = true;
+                return Err(error);
+            }
+        }
+        if let Some(max_tokens) = self.config.max_tokens {
+            if rt.total_tokens >= max_tokens {
+                let mut error = GraphFailure::new(
+                    path,
+                    format!("Token budget exceeded ({}/{max_tokens})", rt.total_tokens),
+                );
+                error.budget_exceeded = true;
+                return Err(error);
+            }
+        }
+        if let Some(max_cost) = self.config.max_cost_usd {
+            if rt.total_cost_usd >= max_cost {
+                let mut error = GraphFailure::new(
+                    path,
+                    format!(
+                        "Cost budget exceeded (${:.4}/${:.4})",
+                        rt.total_cost_usd, max_cost
+                    ),
+                );
+                error.budget_exceeded = true;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_run_usage(&self, usage: &AgentUsage) {
+        let mut rt = lock(&self.runtime);
+        rt.total_tokens = rt.total_tokens.saturating_add(usage.total_tokens());
+        rt.total_cost_usd += usage.cost_usd.max(0.0);
     }
 
     fn worker_call(&self, path: &str) -> Result<(), GraphFailure> {
@@ -1301,6 +1541,7 @@ impl GraphRunner {
         path: &str,
         ctx: &Context,
         held: &BTreeSet<String>,
+        in_finally: bool,
         span: &mut NodeTelemetry,
     ) -> Result<(), GraphFailure> {
         let started = Instant::now();
@@ -1338,21 +1579,35 @@ impl GraphRunner {
             Vec::new()
         };
         let mut last_context_usage = None;
-        let mut previous = None;
-        for attempt in 0..=n.max_retries {
-            let count = attempt + 1;
+        let mut seen_signatures: Vec<String> = Vec::new();
+        let mut repair_attempt: usize = 0;
+        let mut transient_used: usize = 0;
+        let mut total_attempts: usize = 0;
+        let protected = n.protected_paths.as_ref().filter(|p| !p.is_empty());
+        loop {
+            if !in_finally {
+                self.check_budgets(path)?;
+            }
+            let count = total_attempts + 1;
             if n.kind == TaskKind::Worker {
                 self.worker_call(path)?;
             }
+            let protected_before = match protected {
+                Some(spec) => Some(
+                    metadata(|| snapshot_protected(spec))
+                        .map_err(|e| GraphFailure::new(path, format!("Protected paths: {e}")))?,
+                ),
+                None => None,
+            };
             let timestamp = now();
-            self.record(path, extend(fields.clone(), json!({"status":"running","attempts":attempt,"started_at":timestamp,"updated_at":timestamp})), false)?;
+            self.record(path, extend(fields.clone(), json!({"status":"running","attempts":total_attempts,"started_at":timestamp,"updated_at":timestamp})), false)?;
             self.emit(
                 "node_start",
                 json!({"node":path,"kind":n.kind,"attempt":count}),
             );
             let mut detached = None;
             span.attempts = count;
-            let result = invoke(n, ctx, path, attempt, &resources, &mut detached);
+            let result = invoke(n, ctx, path, repair_attempt, &resources, &mut detached);
             let direct = result
                 .as_ref()
                 .ok()
@@ -1385,6 +1640,7 @@ impl GraphRunner {
                 direct.or_else(|| usage_increment(last_context_usage.as_ref(), current.as_ref()));
             last_context_usage = current;
             if let Some(usage) = usage {
+                self.record_run_usage(&usage);
                 span.agent_usage
                     .get_or_insert_with(Default::default)
                     .add_assign(&usage);
@@ -1395,7 +1651,7 @@ impl GraphRunner {
                     usage_records,
                 });
             }
-            let outcome = match outcome {
+            let mut outcome = match outcome {
                 Ok(verified) => verified,
                 Err(TaskRunError::Graph(e)) => {
                     let mut e = *e;
@@ -1413,6 +1669,18 @@ impl GraphRunner {
                     VerifyOutcome::fail(signature, detail)
                 }
             };
+            if outcome.ok {
+                if let (Some(spec), Some(before)) = (protected, protected_before.as_deref()) {
+                    let after = metadata(|| snapshot_protected(spec))
+                        .map_err(|e| GraphFailure::new(path, format!("Protected paths: {e}")))?;
+                    if after != before {
+                        outcome = VerifyOutcome::fail(
+                            "protected_path_modified",
+                            "Protected files were modified or deleted during execution",
+                        );
+                    }
+                }
+            }
             if outcome.ok {
                 let (out_paths, hashes, final_hash) = metadata(|| {
                     let paths = (n.outputs_fn)(ctx)?;
@@ -1450,9 +1718,46 @@ impl GraphRunner {
                 return Ok(());
             }
             span.error_signatures.push(outcome.error_signature.clone());
-            let broken = previous.as_ref() == Some(&outcome.error_signature);
-            if broken || attempt == n.max_retries {
-                return self.verification_failed(path, fields, count, started, &outcome, broken);
+            total_attempts += 1;
+            if transient_used < n.retry_policy.transient_retries
+                && is_transient_failure(&n.retry_policy, &outcome)
+            {
+                let delay = backoff_duration(&n.retry_policy, transient_used)
+                    .unwrap_or_else(|| Duration::from_secs_f64(0.5 * 2f64.powi(transient_used.min(6) as i32)));
+                transient_used += 1;
+                self.log(format!(
+                    "[graph:backoff] {path} transient failure ({}/{}, sleeping {:.2}s): {}",
+                    transient_used,
+                    n.retry_policy.transient_retries,
+                    delay.as_secs_f64(),
+                    outcome.detail
+                ));
+                self.emit(
+                    "node_transient_retry",
+                    json!({"node":path,"kind":n.kind,"attempt":count,"transient_attempt":transient_used,"backoff_s":delay.as_secs_f64(),"error_signature":outcome.error_signature,"detail":outcome.detail}),
+                );
+                if let Some(worker) = detached {
+                    let _ = worker.join();
+                }
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+                continue;
+            }
+            let breaker = detect_breaker(
+                &seen_signatures,
+                &outcome.error_signature,
+                n.retry_policy.oscillation_breaker,
+            );
+            if breaker.is_some() || repair_attempt == n.max_retries {
+                return self.verification_failed(
+                    path,
+                    fields,
+                    count,
+                    started,
+                    &outcome,
+                    breaker.as_deref(),
+                );
             }
             self.log(format!(
                 "[graph:retry]  {path} attempt {count} failed ({}): {}",
@@ -1463,6 +1768,11 @@ impl GraphRunner {
                 // Repair and retry use the same exclusive resources as the callback.
                 let _ = worker.join();
             }
+            if let Some(delay) = backoff_duration(&n.retry_policy, repair_attempt) {
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+            }
             if let Some(repair) = &n.repair_fn {
                 metadata(|| repair(ctx, count, &outcome.error_signature, &outcome.detail))
                     .map_err(|e| {
@@ -1470,9 +1780,9 @@ impl GraphRunner {
                         record_error(count, e)
                     })?;
             }
-            previous = Some(outcome.error_signature);
+            seen_signatures.push(outcome.error_signature);
+            repair_attempt += 1;
         }
-        unreachable!("at least one attempt")
     }
 
     fn run_loop(
@@ -1484,10 +1794,24 @@ impl GraphRunner {
     ) -> Result<(), GraphFailure> {
         let ctx = scope.ctx;
         let started = Instant::now();
-        let mut previous = None;
-        for attempt in 0..=n.max_retries {
-            let count = attempt + 1;
+        let mut seen_signatures: Vec<String> = Vec::new();
+        let mut repair_attempt: usize = 0;
+        let mut transient_used: usize = 0;
+        let mut total_attempts: usize = 0;
+        let protected = n.protected_paths.as_ref().filter(|p| !p.is_empty());
+        loop {
+            if !scope.in_finally {
+                self.check_budgets(path)?;
+            }
+            let count = total_attempts + 1;
             span.attempts = count;
+            let protected_before = match protected {
+                Some(spec) => Some(
+                    metadata(|| snapshot_protected(spec))
+                        .map_err(|e| GraphFailure::new(path, format!("Protected paths: {e}")))?,
+                ),
+                None => None,
+            };
             self.log(format!(
                 "[loop_sg:iter] {path} (attempt {count}/{})",
                 n.max_retries + 1
@@ -1500,8 +1824,20 @@ impl GraphRunner {
             if self.reached_path().is_some() {
                 return Ok(());
             }
-            let outcome =
+            let mut outcome =
                 metadata(|| (n.verify_fn)(ctx)).map_err(|e| GraphFailure::new(path, e))?;
+            if outcome.ok {
+                if let (Some(spec), Some(before)) = (protected, protected_before.as_deref()) {
+                    let after = metadata(|| snapshot_protected(spec))
+                        .map_err(|e| GraphFailure::new(path, format!("Protected paths: {e}")))?;
+                    if after != before {
+                        outcome = VerifyOutcome::fail(
+                            "protected_path_modified",
+                            "Protected files were modified or deleted during loop iteration",
+                        );
+                    }
+                }
+            }
             if outcome.ok {
                 let dur = duration(started);
                 self.record(path,json!({"kind":"loop_subgraph","status":"passed","attempts":count,"duration_s":dur,
@@ -1514,15 +1850,42 @@ impl GraphRunner {
                 return Ok(());
             }
             span.error_signatures.push(outcome.error_signature.clone());
-            let broken = previous.as_ref() == Some(&outcome.error_signature);
-            if broken || attempt == n.max_retries {
+            total_attempts += 1;
+            if transient_used < n.retry_policy.transient_retries
+                && is_transient_failure(&n.retry_policy, &outcome)
+            {
+                let delay = backoff_duration(&n.retry_policy, transient_used)
+                    .unwrap_or_else(|| Duration::from_secs_f64(0.5 * 2f64.powi(transient_used.min(6) as i32)));
+                transient_used += 1;
+                self.log(format!(
+                    "[loop_sg:back] {path} transient failure ({}/{}, sleeping {:.2}s): {}",
+                    transient_used,
+                    n.retry_policy.transient_retries,
+                    delay.as_secs_f64(),
+                    outcome.detail
+                ));
+                self.emit(
+                    "node_transient_retry",
+                    json!({"node":path,"kind":"loop_subgraph","attempt":count,"transient_attempt":transient_used,"backoff_s":delay.as_secs_f64(),"error_signature":outcome.error_signature,"detail":outcome.detail}),
+                );
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+                continue;
+            }
+            let breaker = detect_breaker(
+                &seen_signatures,
+                &outcome.error_signature,
+                n.retry_policy.oscillation_breaker,
+            );
+            if breaker.is_some() || repair_attempt == n.max_retries {
                 return self.verification_failed(
                     path,
                     json!({"kind":"loop_subgraph"}),
                     count,
                     started,
                     &outcome,
-                    broken,
+                    breaker.as_deref(),
                 );
             }
             self.log(format!(
@@ -1530,6 +1893,11 @@ impl GraphRunner {
                 outcome.error_signature, outcome.detail
             ));
             self.emit("node_retry",json!({"node":path,"kind":"loop_subgraph","attempt":count,"error_signature":outcome.error_signature,"detail":outcome.detail}));
+            if let Some(delay) = backoff_duration(&n.retry_policy, repair_attempt) {
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+            }
             if let Some(repair) = &n.repair_fn {
                 let dirty =
                     callback(|| repair(ctx, count, &outcome.error_signature, &outcome.detail))
@@ -1544,9 +1912,9 @@ impl GraphRunner {
                         });
                 }
             }
-            previous = Some(outcome.error_signature);
+            seen_signatures.push(outcome.error_signature);
+            repair_attempt += 1;
         }
-        unreachable!("at least one attempt")
     }
 
     fn verification_failed(
@@ -1556,30 +1924,28 @@ impl GraphRunner {
         count: usize,
         started: Instant,
         outcome: &VerifyOutcome,
-        broken: bool,
+        breaker: Option<&str>,
     ) -> Result<(), GraphFailure> {
         let is_loop = fields["kind"] == "loop_subgraph";
+        let broken = breaker.is_some();
         self.record(path,extend(fields,json!({"status":if broken {"circuit_broken"} else {"failed"},
             "attempts":count,"duration_s":duration(started),"error_signature":outcome.error_signature,"detail":outcome.detail,"updated_at":now()})),true)?;
-        let reason = if broken {
+        let reason = if let Some(breaker_label) = breaker {
             let label = if is_loop {
                 "[loop_sg:BRK] "
             } else {
                 "[graph:BREAK] "
             };
             self.log(format!(
-                "{label} {path} circuit breaker tripped on 2x '{}': {}",
-                outcome.error_signature, outcome.detail
+                "{label} {path} circuit breaker tripped on {breaker_label}: {}",
+                outcome.detail
             ));
             let prefix = if is_loop {
                 "Subgraph circuit breaker"
             } else {
                 "Circuit breaker"
             };
-            format!(
-                "{prefix} (2x '{}'): {}",
-                outcome.error_signature, outcome.detail
-            )
+            format!("{prefix} ({breaker_label}): {}", outcome.detail)
         } else {
             if !is_loop {
                 self.log(format!(
@@ -3047,5 +3413,174 @@ mod tests {
         assert_eq!(read_state(&alias).unwrap().nodes.len(), 2);
         assert!(dir.path().join("graph_state.json.lock").exists());
         assert!(!dir.path().join("alias.json.lock").exists());
+    }
+
+    #[test]
+    fn oscillation_breaker_detects_ab_a_ping_pong_and_can_be_disabled() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut node = task("osc");
+        node.max_retries = 5;
+        node.verify_fn = Some(Arc::new(move |_, _| {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            match n {
+                0 => VerifyOutcome::fail("err_A", "first A"),
+                1 => VerifyOutcome::fail("err_B", "flipped to B"),
+                2 => VerifyOutcome::fail("err_A", "back to A"),
+                _ => VerifyOutcome::pass("recovered"),
+            }
+        }));
+        let runner = GraphRunner::new(config(dir.path())).unwrap();
+        let err = run(&runner, &[Node::Task(node.clone())]).unwrap_err();
+        assert!(err.circuit_broken);
+        assert!(err.reason.contains("oscillation: err_A -> err_B -> err_A"), "{}", err.reason);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // When oscillation_breaker is disabled, A -> B -> A -> pass succeeds.
+        calls.store(0, Ordering::SeqCst);
+        node.retry_policy.oscillation_breaker = false;
+        let dir2 = tempdir().unwrap();
+        let runner2 = GraphRunner::new(config(dir2.path())).unwrap();
+        run(&runner2, &[Node::Task(node)]).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn transient_retries_do_not_consume_repair_budget_or_trip_circuit_breaker() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let mut node = task("rate_limited");
+        node.max_retries = 0;
+        node.retry_policy.transient_retries = 2;
+        node.retry_policy.backoff_s = Some(0.001);
+        node.retry_policy.jitter = false;
+        node.verify_fn = Some(Arc::new(move |_, _| {
+            let n = c.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                VerifyOutcome::fail("http_429", "HTTP 429 Too Many Requests")
+            } else {
+                VerifyOutcome::pass("succeeded after backoff")
+            }
+        }));
+        let runner = GraphRunner::new(config(dir.path())).unwrap();
+        run(&runner, &[Node::Task(node)]).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cost_token_and_wall_time_budgets_stop_execution_cleanly() {
+        let dir = tempdir().unwrap();
+        let mut first = task("first");
+        first.run_fn = Arc::new(|_, _| {
+            Ok(json!({
+                "__kgraph_usage": {"input_tokens": 600, "output_tokens": 500, "cached_tokens": 0, "cost_usd": 0.75}
+            }))
+        });
+        let mut second = task("second");
+        second.deps = vec!["first".into()];
+
+        // Token budget exceeded before second node
+        let runner = GraphRunner::new(RunnerConfig {
+            max_tokens: Some(1000),
+            ..config(dir.path())
+        })
+        .unwrap();
+        let err = run(&runner, &[Node::Task(first.clone()), Node::Task(second.clone())]).unwrap_err();
+        assert!(err.budget_exceeded);
+        assert!(err.reason.contains("Token budget exceeded"), "{}", err.reason);
+
+        // Cost budget exceeded before second node
+        let dir2 = tempdir().unwrap();
+        let runner2 = GraphRunner::new(RunnerConfig {
+            max_cost_usd: Some(0.50),
+            ..config(dir2.path())
+        })
+        .unwrap();
+        let err2 = run(&runner2, &[Node::Task(first), Node::Task(second)]).unwrap_err();
+        assert!(err2.budget_exceeded);
+        assert!(err2.reason.contains("Cost budget exceeded"), "{}", err2.reason);
+    }
+
+    #[test]
+    fn conditional_when_skips_node_and_finally_runs_on_failure() {
+        let dir = tempdir().unwrap();
+        let ran = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let r1 = ran.clone();
+        let mut skipped = task("optional");
+        skipped.when_fn = Some(Arc::new(|ctx| Ok(ctx.get("enable").and_then(|v| v.as_bool()).unwrap_or(false))));
+        skipped.when_expr = Some("ctx.enable".into());
+        skipped.run_fn = Arc::new(move |_, _| {
+            r1.lock().unwrap().push("optional".into());
+            Ok(Value::Null)
+        });
+
+        let r2 = ran.clone();
+        let mut failing = task("main_work");
+        failing.deps = vec!["optional".into()];
+        failing.run_fn = Arc::new(move |_, _| {
+            r2.lock().unwrap().push("main_work".into());
+            Ok(Value::Null)
+        });
+        failing.verify_fn = Some(Arc::new(|_, _| VerifyOutcome::fail("boom", "main failed")));
+
+        let r3 = ran.clone();
+        let mut cleanup = task("cleanup");
+        cleanup.run_fn = Arc::new(move |ctx, _| {
+            let status = ctx
+                .get("__kgraph_run_status")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            r3.lock().unwrap().push(format!("cleanup:{status}"));
+            Ok(Value::Null)
+        });
+
+        let runner = GraphRunner::new(RunnerConfig {
+            finally_nodes: vec![Node::Task(cleanup)],
+            ..config(dir.path())
+        })
+        .unwrap();
+        let plan = runner
+            .plan(&[Node::Task(skipped.clone()), Node::Task(failing.clone())], &Context::new(), "")
+            .unwrap();
+        assert_eq!(plan[0].status, "skipped");
+        assert_eq!(plan[0].reason.as_deref(), Some("condition_false"));
+
+        let err = run(&runner, &[Node::Task(skipped), Node::Task(failing)]).unwrap_err();
+        assert_eq!(err.node_path, "main_work");
+        assert_eq!(
+            *ran.lock().unwrap(),
+            vec!["main_work".to_string(), "cleanup:failed".to_string()]
+        );
+        let state = read_state(&config(dir.path()).state_path).unwrap();
+        assert_eq!(state.nodes["optional"]["status"], "skipped");
+        assert_eq!(state.nodes["finally/cleanup"]["status"], "passed");
+    }
+
+    #[test]
+    fn protected_paths_detect_reward_hijacking() {
+        let dir = tempdir().unwrap();
+        let test_file = dir.path().join("protected_test.rs");
+        fs::write(&test_file, "assert_eq!(2 + 2, 4);").unwrap();
+        let target = test_file.clone();
+        let mut node = task("sneaky_agent");
+        node.protected_paths = Some(ProtectedPaths {
+            base_dir: dir.path().to_path_buf(),
+            paths: vec![PathBuf::from("protected_test.rs")],
+            globs: vec![],
+        });
+        node.run_fn = Arc::new(move |_, _| {
+            fs::write(&target, "assert_eq!(2 + 2, 5); // weakened test").unwrap();
+            Ok(Value::Null)
+        });
+        let runner = GraphRunner::new(config(dir.path())).unwrap();
+        let err = run(&runner, &[Node::Task(node)]).unwrap_err();
+        assert!(err.reason.contains("Protected files were modified"), "{}", err.reason);
+        let state = read_state(&config(dir.path()).state_path).unwrap();
+        assert_eq!(state.nodes["sneaky_agent"]["error_signature"], "protected_path_modified");
     }
 }

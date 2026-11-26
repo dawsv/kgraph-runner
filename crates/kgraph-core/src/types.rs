@@ -296,8 +296,58 @@ pub type LoopRepairFn =
     Arc<dyn Fn(&Context, usize, &str, &str) -> Result<Vec<String>, GraphFailure> + Send + Sync>;
 pub type SplitterItemsFn = Arc<dyn Fn(&Context) -> Result<Vec<Value>, String> + Send + Sync>;
 pub type SplitterChildBuilderFn = Arc<dyn Fn(&Value, &Context) -> Result<Node, String> + Send + Sync>;
+pub type WhenFn = Arc<dyn Fn(&Context) -> Result<bool, String> + Send + Sync>;
 pub type EventHook = Arc<dyn Fn(&Value) + Send + Sync>;
 pub type LoggerFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Retry, backoff, transient-error, and oscillation-breaker controls for tasks and loops.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Initial backoff in seconds before retrying (exponential: `base * 2^attempt`).
+    pub backoff_s: Option<f64>,
+    /// Maximum backoff cap in seconds (defaults to 60s when `backoff_s` is set).
+    pub max_backoff_s: Option<f64>,
+    /// Apply ±20% jitter to backoff sleeps to avoid thundering herds.
+    pub jitter: bool,
+    /// Extra retries reserved for transient infra/rate-limit errors (e.g. 429/529/timeout)
+    /// without consuming `max_retries` or tripping the logic circuit breaker.
+    pub transient_retries: usize,
+    /// Optional regex matching `error_signature` or `detail` for transient errors.
+    pub transient_error_regex: Option<String>,
+    /// Trip the circuit breaker on ping-pong oscillation cycles (e.g. `A -> B -> A`)
+    /// in addition to consecutive `A -> A` stagnation.
+    pub oscillation_breaker: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            backoff_s: None,
+            max_backoff_s: None,
+            jitter: true,
+            transient_retries: 0,
+            transient_error_regex: None,
+            oscillation_breaker: true,
+        }
+    }
+}
+
+/// Files or globs whose SHA-256 fingerprint must remain unchanged during execution
+/// (anti-reward-hijacking guard against agents weakening tests or configs).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtectedPaths {
+    pub base_dir: PathBuf,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub globs: Vec<String>,
+}
+
+impl ProtectedPaths {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.globs.is_empty()
+    }
+}
 
 /// Optional visual retry routing metadata attached to a `LoopSubgraphNode`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -317,12 +367,16 @@ pub struct TaskNode {
     pub verify_fn: Option<VerifyFn>,
     pub repair_fn: Option<RepairFn>,
     pub max_retries: usize,
+    pub retry_policy: RetryPolicy,
     pub timeout_s: Option<f64>,
     pub deps: Vec<String>,
     pub cacheable: bool,
     pub resource: Option<String>,
     pub efficiency_fn: Option<EfficiencyFn>,
     pub qa_checklist_path: Option<PathBuf>,
+    pub when_fn: Option<WhenFn>,
+    pub when_expr: Option<String>,
+    pub protected_paths: Option<ProtectedPaths>,
 }
 
 impl TaskNode {
@@ -336,12 +390,16 @@ impl TaskNode {
             verify_fn: None,
             repair_fn: None,
             max_retries: 0,
+            retry_policy: RetryPolicy::default(),
             timeout_s: None,
             deps: Vec::new(),
             cacheable: true,
             resource: None,
             efficiency_fn: None,
             qa_checklist_path: None,
+            when_fn: None,
+            when_expr: None,
+            protected_paths: None,
         }
     }
 }
@@ -353,6 +411,8 @@ pub struct SubgraphNode {
     pub deps: Vec<String>,
     pub resource: Option<String>,
     pub qa_checklist_path: Option<PathBuf>,
+    pub when_fn: Option<WhenFn>,
+    pub when_expr: Option<String>,
 }
 
 impl SubgraphNode {
@@ -363,6 +423,8 @@ impl SubgraphNode {
             deps: Vec::new(),
             resource: None,
             qa_checklist_path: None,
+            when_fn: None,
+            when_expr: None,
         }
     }
 }
@@ -374,10 +436,14 @@ pub struct LoopSubgraphNode {
     pub verify_fn: LoopVerifyFn,
     pub repair_fn: Option<LoopRepairFn>,
     pub max_retries: usize,
+    pub retry_policy: RetryPolicy,
     pub deps: Vec<String>,
     pub resource: Option<String>,
     pub retry_route: Option<RetryRoute>,
     pub qa_checklist_path: Option<PathBuf>,
+    pub when_fn: Option<WhenFn>,
+    pub when_expr: Option<String>,
+    pub protected_paths: Option<ProtectedPaths>,
 }
 
 impl LoopSubgraphNode {
@@ -388,10 +454,14 @@ impl LoopSubgraphNode {
             verify_fn,
             repair_fn: None,
             max_retries: 2,
+            retry_policy: RetryPolicy::default(),
             deps: Vec::new(),
             resource: None,
             retry_route: None,
             qa_checklist_path: None,
+            when_fn: None,
+            when_expr: None,
+            protected_paths: None,
         }
     }
 }
@@ -405,6 +475,8 @@ pub struct SplitterNode {
     pub max_workers: usize,
     pub resource: Option<String>,
     pub qa_checklist_path: Option<PathBuf>,
+    pub when_fn: Option<WhenFn>,
+    pub when_expr: Option<String>,
 }
 
 impl SplitterNode {
@@ -421,6 +493,8 @@ impl SplitterNode {
             max_workers: 4,
             resource: None,
             qa_checklist_path: None,
+            when_fn: None,
+            when_expr: None,
         }
     }
 }
@@ -494,6 +568,24 @@ impl Node {
             Node::Subgraph(n) => n.qa_checklist_path.as_ref(),
             Node::LoopSubgraph(n) => n.qa_checklist_path.as_ref(),
             Node::Splitter(n) => n.qa_checklist_path.as_ref(),
+        }
+    }
+
+    pub fn when_fn(&self) -> Option<&WhenFn> {
+        match self {
+            Node::Task(n) => n.when_fn.as_ref(),
+            Node::Subgraph(n) => n.when_fn.as_ref(),
+            Node::LoopSubgraph(n) => n.when_fn.as_ref(),
+            Node::Splitter(n) => n.when_fn.as_ref(),
+        }
+    }
+
+    pub fn when_expr(&self) -> Option<&str> {
+        match self {
+            Node::Task(n) => n.when_expr.as_deref(),
+            Node::Subgraph(n) => n.when_expr.as_deref(),
+            Node::LoopSubgraph(n) => n.when_expr.as_deref(),
+            Node::Splitter(n) => n.when_expr.as_deref(),
         }
     }
 }

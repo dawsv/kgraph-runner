@@ -1,10 +1,13 @@
 //! Command-line entry points shared by the native kgraph and kgraph-town binaries.
 mod analyze;
 mod args;
+mod clean;
 mod display;
+mod doctor;
 mod execution;
 mod init;
 pub mod mcp;
+mod notify;
 mod publisher;
 mod response;
 mod swarm;
@@ -76,6 +79,18 @@ fn dispatch(cmd: Command) -> Result<i32> {
             dir,
             force,
         } => init::scaffold(template, &output, &dir, force),
+        Command::Doctor { json } => doctor::run(json),
+        Command::Clean(args) => clean::run(args),
+        Command::Schema { output } => {
+            let schema = kgraph_subgraphs::workflow_json_schema();
+            if let Some(path) = output {
+                kgraph_core::files::write_json(&path, &schema, true)?;
+                println!("Wrote workflow JSON schema to {}", path.display());
+                Ok(0)
+            } else {
+                print_json(&schema)
+            }
+        }
         Command::Status { state, json } => display::status(&state, json),
         Command::Report { report, json } => display::report(&report, json),
         Command::Qa { action } => display::qa(action),

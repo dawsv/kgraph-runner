@@ -384,13 +384,13 @@ fn stdio_mcp_serves_thirteen_tools_and_recovers_after_errors() {
     let init = rpc.request(1, "initialize", json!({}));
     assert_eq!(
         init["result"],
-        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"kgraph","version":env!("CARGO_PKG_VERSION")}})
+        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"kgraph","version":env!("CARGO_PKG_VERSION")}})
     );
     rpc.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
     rpc.send(r#"{"jsonrpc":"2.0","method":"ping"}"#);
     let list = rpc.request(2, "tools/list", json!({}));
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 15);
     for (tool, name) in tools.iter().zip([
         "plan",
         "run",
@@ -405,12 +405,25 @@ fn stdio_mcp_serves_thirteen_tools_and_recovers_after_errors() {
         "progress",
         "ask",
         "answer",
+        "doctor",
+        "clean",
     ]) {
         assert_eq!(tool["name"], format!("kgraph_{name}"));
         assert_eq!(tool["inputSchema"]["type"], "object");
         assert!(tool["inputSchema"]["properties"].is_object());
         assert!(tool["description"].is_string());
     }
+    // Verify MCP resources (schema, subgraphs, templates) + doctor/clean tools
+    let resources = rpc.request(20, "resources/list", json!({}));
+    assert_eq!(resources["result"]["resources"].as_array().unwrap().len(), 3);
+    let schema_res = rpc.request(21, "resources/read", json!({"uri":"kgraph://schema"}));
+    let schema_text = schema_res["result"]["contents"][0]["text"].as_str().unwrap();
+    let parsed_schema: Value = serde_json::from_str(schema_text).unwrap();
+    assert_eq!(parsed_schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
+    let doc = rpc.tool(22, "kgraph_doctor", json!({}), false);
+    assert_eq!(doc["version"], env!("CARGO_PKG_VERSION"));
+    let cleaned = rpc.tool(23, "kgraph_clean", json!({"dir": p.0.path(), "dry_run": true}), false);
+    assert_eq!(cleaned["dry_run"], true);
     assert_eq!(
         tools[1]["inputSchema"]["properties"]["force"],
         json!({"type":"boolean"})
@@ -604,4 +617,66 @@ fn scaffold_detects_workspace_even_when_output_is_nested() {
             3
         );
     }
+}
+
+#[test]
+fn doctor_schema_clean_and_conditional_finally_cli_round_trip() {
+    let p = Project::new();
+    let doc = p.json(&["doctor", "--json"], 0);
+    assert_eq!(doc["version"], env!("CARGO_PKG_VERSION"));
+    assert!(doc["tools"]["git"]["available"].is_boolean());
+
+    let schema = p.json(&["schema"], 0);
+    assert_eq!(schema["$schema"], "https://json-schema.org/draft/2020-12/schema");
+    assert!(schema["properties"]["budgets"].is_object());
+    assert!(schema["properties"]["finally"].is_object());
+
+    p.write(
+        "conditional.json",
+        &json!({
+            "title": "Conditional + Finally CLI",
+            "default_context": {"run_extra": false},
+            "nodes": [
+                {
+                    "id": "skip_me",
+                    "type": "shell",
+                    "when": "ctx.run_extra",
+                    "command": ["python3", "-c", "open('nope','w').write('1')"]
+                },
+                {
+                    "id": "main",
+                    "type": "shell",
+                    "deps": ["skip_me"],
+                    "command": ["python3", "-c", "open('main_ok.txt','w').write('ok')"],
+                    "outputs": ["main_ok.txt"]
+                }
+            ],
+            "finally": [
+                {
+                    "id": "post",
+                    "type": "shell",
+                    "command": ["python3", "-c", "import os; open('post.txt','w').write(os.environ['S'])"],
+                    "env": {"S": "{{ctx.__kgraph_run_status}}"}
+                }
+            ]
+        }),
+    );
+    let plan = p.json(&["plan", "conditional.json", "--json"], 0);
+    assert_eq!(plan[0]["status"], "skipped");
+    assert_eq!(plan[1]["status"], "will_run");
+
+    p.cli(&["run", "conditional.json", "--quiet"], 0);
+    assert!(!p.path("nope").exists());
+    assert_eq!(fs::read_to_string(p.path("main_ok.txt")).unwrap(), "ok");
+    assert_eq!(fs::read_to_string(p.path("post.txt")).unwrap(), "passed");
+
+    fs::write(p.path(".kgraph/stale.lock"), "").unwrap();
+    let preview = p.json(&["clean", "--dry-run", "--json"], 0);
+    assert_eq!(preview["dry_run"], true);
+    assert!(!preview["files"].as_array().unwrap().is_empty());
+    assert!(p.path(".kgraph/stale.lock").exists());
+
+    let cleaned = p.json(&["clean", "--json"], 0);
+    assert_eq!(cleaned["dry_run"], false);
+    assert!(!p.path(".kgraph/stale.lock").exists());
 }
