@@ -473,9 +473,11 @@ mod tests {
     struct Fixture {
         _temp: TempDir,
         cfg: GameRegressionConfig,
+        #[cfg_attr(not(unix), allow(dead_code))]
         state: PathBuf,
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();

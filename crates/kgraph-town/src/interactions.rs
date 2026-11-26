@@ -152,7 +152,7 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
                 result.pop();
             }
             Component::CurDir => {}
-            _ => {
+            Component::Normal(_) => {
                 result.push(component.as_os_str());
                 match fs::symlink_metadata(&result) {
                     Ok(m) if m.is_symlink() => result = result.canonicalize()?,
@@ -161,6 +161,7 @@ pub fn resolve(path: &Path) -> io::Result<PathBuf> {
                     Err(e) => return Err(e),
                 }
             }
+            _ => result.push(component.as_os_str()),
         }
     }
     Ok(result)
@@ -2048,6 +2049,7 @@ mod tests {
     struct Run {
         _temp: TempDir,
         state: PathBuf,
+        #[cfg_attr(not(unix), allow(dead_code))]
         report: PathBuf,
         packet: PathBuf,
         entry: Map<String, Value>,

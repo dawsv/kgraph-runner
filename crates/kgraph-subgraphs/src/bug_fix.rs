@@ -1038,6 +1038,7 @@ pub fn create_bug_batch_graph(cfg: BugBatchConfig) -> Result<Vec<Node>, String> 
 mod tests {
     use super::*;
     use kgraph_core::engine::{GraphRunner, RunnerConfig};
+    #[cfg(unix)]
     use kgraph_core::qa_metrics::{record_qa_result, QaResultInput};
     use tempfile::TempDir;
 
@@ -1117,6 +1118,7 @@ mod tests {
             )
             .unwrap();
         }
+        #[cfg_attr(not(unix), allow(dead_code))]
         fn value(&self, s: &str) {
             fs::write(self.cfg.repo_dir.join("value"), s).unwrap();
         }
