@@ -89,6 +89,12 @@ pub(crate) fn regular(path: &Path, nofollow: bool) -> io::Result<File> {
                 "Expected a regular file",
             ));
         }
+        if !fs::metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected a regular file",
+            ));
+        }
         options.open(path)?
     };
     if !f.metadata()?.is_file() {

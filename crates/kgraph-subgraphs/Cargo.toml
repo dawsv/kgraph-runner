@@ -7,7 +7,6 @@ description = "Resumable bug-fixing, regression, version-history, Histoury relea
 [dependencies]
 chrono.workspace = true
 kgraph-core.workspace = true
-libc.workspace = true
 once_cell.workspace = true
 regex.workspace = true
 serde.workspace = true
@@ -15,6 +14,9 @@ serde_json.workspace = true
 toml.workspace = true
 url.workspace = true
 zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

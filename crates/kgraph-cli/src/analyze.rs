@@ -20,6 +20,17 @@ fn bounded_runs(path: &Path, limit: usize) -> Result<Vec<RunTelemetry>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK);
     }
+    #[cfg(not(unix))]
+    {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Ok(meta) if !meta.is_file() => {
+                return Err(format!("{}: Expected a regular file", path.display()));
+            }
+            Err(e) => return Err(context(e)),
+            Ok(_) => {}
+        }
+    }
     let file = match options.open(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
         result => result.map_err(context)?,
